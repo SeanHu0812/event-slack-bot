@@ -1,5 +1,3 @@
-# Replit configuration for the community-events-bot.
-# Python 3.12 (avoids the macOS 3.14 cert issue; Replit images ship proper CA certs).
 modules = ["python-3.12"]
 
 # Used when you press "Run" in the editor (for quick testing only).
@@ -13,3 +11,6 @@ entrypoint = "app.py"
 [deployment]
 run = ["python3", "-u", "app.py"]
 deploymentTarget = "gce"
+
+[nix]
+channel = "stable-25_05"
