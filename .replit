@@ -1,0 +1,15 @@
+# Replit configuration for the community-events-bot.
+# Python 3.12 (avoids the macOS 3.14 cert issue; Replit images ship proper CA certs).
+modules = ["python-3.12"]
+
+# Used when you press "Run" in the editor (for quick testing only).
+run = "python3 -u app.py"
+entrypoint = "app.py"
+
+# Deployment config. This bot is a long-running worker with no HTTP port,
+# so it must be deployed as a Reserved VM (background worker), NOT Autoscale.
+# When you create the deployment in the Replit UI, pick "Reserved VM" —
+# that keeps this process (and its Slack websocket) up 24/7.
+[deployment]
+run = ["python3", "-u", "app.py"]
+deploymentTarget = "gce"

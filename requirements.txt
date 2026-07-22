@@ -1,0 +1,4 @@
+slack-bolt>=1.18
+notion-client>=2.7
+anthropic>=0.40
+python-dotenv>=1.0
