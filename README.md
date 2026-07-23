@@ -54,9 +54,12 @@ The page is created with **only** these properties and no page body:
 | `Date` | date | `start = YYYY-MM-DD` |
 | `City` | select | must match a valid option or is omitted |
 | `Partner` | rich_text | |
-| `Cost` | rich_text | kept as written, e.g. "$3k" |
+| `Estimated Cost` | number | proposal cost, converted to a number (e.g. "$3k" → 3000) |
 | `Invite Link` | rich_text | plain text, not a url-type property |
 | `Notes` | rich_text | holds `slack_ts:<ts>` — the dedup marker |
+
+The bot **never writes to `Actual Cost`** — that number field is filled in manually
+after an event happens. Proposal cost goes only to `Estimated Cost`.
 
 Valid `City` options: Atlanta, Austin, Boston, Chicago, Holiday, LA/El Segundo, Miami,
 Montana, NYC, Nashville, New Mexico, Phoenix, SF, San Diego, Seattle, Vegas, DC.

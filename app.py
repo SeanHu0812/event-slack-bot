@@ -30,6 +30,23 @@ def rt(text):
     return {"rich_text": [{"text": {"content": text or ""}}]}
 
 
+def to_number(v):
+    """Coerce a cost value into a plain number of dollars, or None.
+    Handles shorthand like '$3k' -> 3000 and '2.5k' -> 2500 as a safety net
+    in case the model returns a string instead of a number."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v).strip().lower().replace("$", "").replace(",", "")
+    try:
+        if s.endswith("k"):
+            return float(s[:-1]) * 1000
+        return float(s)
+    except ValueError:
+        return None
+
+
 def parse_proposal(text):
     """Extract event fields from a free-text proposal. Returns a dict with an
     'event' key that is None when the message is not actually a proposal."""
@@ -42,6 +59,9 @@ def parse_proposal(text):
         "For date: if the message gives a month/day with no year, choose the year that "
         "makes the date fall on or after today (i.e. the next upcoming occurrence), since "
         "proposals are for future events. If no date is given at all, use null. "
+        "For cost: return a plain NUMBER of US dollars with no symbols or separators, "
+        "converting shorthand (e.g. '$3k' -> 3000, '2.5k' -> 2500, '$1,200' -> 1200). "
+        "Use null if no cost is given. "
         f"city must be exactly one of {sorted(VALID_CITIES)} or null; proposals often "
         "write things like 'SF Partnered' or 'NYC dinner', so normalize to the matching "
         "option. Use null (not a guess) when a field is absent. "
@@ -92,7 +112,9 @@ def create_notion_page(f, ts):
         "Event": {"title": [{"text": {"content": f["event"]}}]},
         "Date":  {"date": {"start": f["date"]}},
         "Partner":     rt(f.get("partner")),
-        "Cost":        rt(f.get("cost")),
+        # Proposal cost goes to "Estimated Cost" (a number field).
+        # Never write to "Actual Cost" — that is filled in manually post-event.
+        "Estimated Cost": {"number": to_number(f.get("cost"))},
         "Invite Link": rt(f.get("invite_link")),
         "Notes":       rt(f"slack_ts:{ts}"),
     }
