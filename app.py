@@ -51,6 +51,7 @@ RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
 DREW_ID = "U037HBMJBHU"                  # reps-assignment owner, DMed when reps are missing
 DONE_EMOJI = "done"                      # Drew reacts this to release the rundown
 REPS_REMINDER_SENTINEL = "Reps assignment are missing"
+MY_EVENTS_HORIZON_DAYS = 60              # how far ahead /my-event looks
 
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -591,6 +592,76 @@ def weekly_scheduler(client):
 
 
 # ---------------------------------------------------------------------------
+# /my-event — a rep's own upcoming assignments
+# ---------------------------------------------------------------------------
+
+def _query_all(filt, sorts):
+    """Query the events data source across all pages for a filter."""
+    results, cursor = [], None
+    while True:
+        kwargs = {"data_source_id": data_source_id(), "filter": filt,
+                  "sorts": sorts, "page_size": 100}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        r = notion.data_sources.query(**kwargs)
+        results.extend(r["results"])
+        if not r.get("has_more"):
+            return results
+        cursor = r.get("next_cursor")
+
+
+def fetch_assigned_events(slack_user_id):
+    """Upcoming events (any city, next MY_EVENTS_HORIZON_DAYS) assigned to this
+    Slack user. Returns None if the user isn't in the rep map at all."""
+    mapping = rep_map()
+    my_names = {name for name, sid in mapping.items() if sid == slack_user_id}
+    if not my_names:
+        return None
+    today = datetime.now(RUNDOWN_TZ).date()
+    end = today + timedelta(days=MY_EVENTS_HORIZON_DAYS)
+    pages = _query_all(
+        {"and": [
+            {"property": "Date", "date": {"on_or_after": today.isoformat()}},
+            {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+        ]},
+        [{"property": "Date", "direction": "ascending"}])
+    events = []
+    for page in pages:
+        props = page["properties"]
+        reps = [o["name"] for o in props.get("Reps", {}).get("multi_select", [])]
+        if not any(r.strip().lower() in my_names for r in reps):
+            continue
+        name = _plain(props["Event"]["title"]).strip()
+        if name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
+            continue
+        d = (props.get("Date") or {}).get("date") or {}
+        if not d.get("start"):
+            continue
+        events.append({
+            "event": name,
+            "date": d["start"][:10],
+            "city": (props.get("City", {}).get("select") or {}).get("name"),
+            "invite": first_url(_plain(props.get("Invite Link", {}).get("rich_text"))),
+        })
+    return events
+
+
+def build_my_events(slack_user_id):
+    events = fetch_assigned_events(slack_user_id)
+    if events is None:
+        return ("I don't have you mapped to a rep yet, so I can't look up your events. "
+                "Ask an admin to add your name + Slack ID to the rep sheet.")
+    if not events:
+        return f"You have no events assigned in the next {MY_EVENTS_HORIZON_DAYS} days. :tada:"
+    out = ["_Your upcoming events_ :calendar:", ""]
+    for e in events:
+        link = f"<{e['invite']}|{e['event']}>" if e["invite"] else e["event"]
+        city = f" ({e['city']})" if e.get("city") else ""
+        out.append(f"• {fmt_day(e['date'])}{city} — {link}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Slack handlers
 # ---------------------------------------------------------------------------
 
@@ -769,6 +840,22 @@ def _send_week_preview(client, channel, user):
     except Exception:
         client.chat_postMessage(channel=user, text=text)
     log.info("posted /events-this-week preview for %s", user)
+
+
+@app.command("/my-events")          # accept both spellings
+@app.command("/my-event")
+def cmd_my_events(ack, body, client):
+    ack()
+    _bg(_send_my_events, client, body.get("channel_id"), body.get("user_id"))
+
+
+def _send_my_events(client, channel, user):
+    text = build_my_events(user)
+    try:
+        client.chat_postEphemeral(channel=channel, user=user, text=text)
+    except Exception:
+        client.chat_postMessage(channel=user, text=text)
+    log.info("posted /my-event for %s", user)
 
 
 class _Health(BaseHTTPRequestHandler):
