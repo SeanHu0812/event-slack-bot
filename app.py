@@ -665,6 +665,8 @@ def build_my_events(slack_user_id):
         link = f"<{e['invite']}|{e['event']}>" if e["invite"] else e["event"]
         city = f" ({e['city']})" if e.get("city") else ""
         out.append(f"• {fmt_day(e['date'])}{city} — {link}")
+    out.append("")
+    out.append("Can no longer make it to an event? Tag me and let me know the change. Thank you!")
     return "\n".join(out)
 
 
