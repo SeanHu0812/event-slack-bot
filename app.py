@@ -1,4 +1,5 @@
-import os, json, base64, logging
+import os, json, base64, csv, io, logging
+import urllib.request
 from datetime import date, datetime
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -175,6 +176,26 @@ def sheet_handle():
     return _sheet
 
 
+def _fetch_csv_grid(url):
+    """Fetch a published-to-web CSV URL and return it as a list of rows."""
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        data = resp.read().decode("utf-8", "replace")
+    return list(csv.reader(io.StringIO(data)))
+
+
+def load_grid(tab):
+    """Return a city tab as a 2D list of strings, from whichever backend is
+    configured: a service account (preferred, if creds are present) or a
+    published-to-web CSV URL in BUDGET_CSV_<TAB>. None if neither is set."""
+    sheet = sheet_handle()
+    if sheet is not None:
+        return sheet.worksheet(tab).get_all_values()
+    url = os.environ.get(f"BUDGET_CSV_{tab.upper()}")
+    if url:
+        return _fetch_csv_grid(url)
+    return None
+
+
 def _money(s):
     """Parse a spreadsheet money cell like '$95,000.00' or '($2,642)' into a float."""
     s = (s or "").strip().replace("$", "").replace(",", "")
@@ -192,10 +213,9 @@ def read_budget(tab, month):
     """Read (monthly_budget, estimated_allocated_for_month) from a city tab.
     `month` is formatted like 'Sep 2026'. Locates cells by content so it is
     robust to the exact column the analysis panel sits in."""
-    sheet = sheet_handle()
-    if sheet is None:
+    grid = load_grid(tab)
+    if not grid:
         return None, None
-    grid = sheet.worksheet(tab).get_all_values()
 
     # 1) Monthly Budget: the value to the right of a "Monthly Budget" label cell.
     budget = None

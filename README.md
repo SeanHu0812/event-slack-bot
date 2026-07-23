@@ -61,13 +61,23 @@ If the Google credentials aren't configured, budget checks are skipped entirely.
 - Bot invited to #community-team (`/invite @your-bot`).
 - **Reinstall the app** after changing scopes or event subscriptions.
 
-## Budget sheet config (Google service account)
+## Budget sheet config
 
-- Create a Google Cloud service account, enable the Google Sheets API, and download its
-  JSON key. Put the key (full JSON on one line, or its base64) in `GOOGLE_SERVICE_ACCOUNT_JSON`.
-- **Share the budget spreadsheet** with the service account's `client_email` (Viewer).
-- Tab titles must be `NYC` and `SF`; each needs a `Monthly Budget` cell and a
-  `Cost Analysis Per Month` table (Month / Estimated columns).
+The bot reads the budget from either backend; whichever is configured wins (service
+account first). Each city tab needs a `Monthly Budget` cell and a `Cost Analysis Per
+Month` table (Month / Estimated columns) — cells are located by content, not position.
+
+**Option A — published CSV (no credentials, public tab):**
+- In the sheet: **File → Share → Publish to web**, pick a tab, format **CSV**, Publish.
+- Put the resulting URL in `BUDGET_CSV_NYC` / `BUDGET_CSV_SF` (one per tab).
+- Live, but Google caches published output (~up to 5 min lag). The published tabs are
+  readable by anyone with the URL.
+
+**Option B — Google service account (private, preferred):**
+- Create a service account, enable the Google Sheets API, download its JSON key. Put it
+  (full JSON on one line, or base64) in `GOOGLE_SERVICE_ACCOUNT_JSON`.
+- **Share the spreadsheet** with the service account's `client_email` (Viewer).
+- Tab titles must be exactly `NYC` and `SF`.
 
 ## Notion config (already done)
 
