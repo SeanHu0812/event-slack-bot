@@ -1,6 +1,7 @@
-import os, json, base64, csv, io, logging
+import os, json, base64, csv, io, logging, threading
 import urllib.request
 from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -565,6 +566,26 @@ def on_check_budget(ack, body, view, client):
         log.exception("failed to build/post budget report")
 
 
+class _Health(BaseHTTPRequestHandler):
+    """Trivial 200-OK responder."""
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *args):    # silence per-request logging
+        pass
+
+
+def start_health_server():
+    """Open a port so hosts that health-check for one (e.g. Replit Reserved VM)
+    consider the app 'ready'. The bot itself talks to Slack over an outbound
+    websocket and needs no inbound port; this server exists only for the check."""
+    port = int(os.environ.get("PORT", "8080"))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+
 if __name__ == "__main__":
     log.info("events-bot starting (socket mode)")
+    threading.Thread(target=start_health_server, daemon=True).start()
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
