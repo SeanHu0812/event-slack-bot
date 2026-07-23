@@ -752,7 +752,8 @@ def _send_budget_report(client, channel, user, locations, months):
     client.chat_postMessage(channel=user, text=text)
 
 
-@app.command("/events-this-week")
+@app.command("/events-this-week")   # accept both spellings of the command name
+@app.command("/event-this-week")
 def cmd_events_week(ack, body, client):
     ack()
     _bg(_send_week_preview, client, body.get("channel_id"), body.get("user_id"))
