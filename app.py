@@ -767,7 +767,6 @@ def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
         return
-    _bot_threads.add((channel, thread_ts))         # follow the rest of this thread
     context = thread_transcript(client, channel, thread_ts, msg_ts)
     events = upcoming_events_for_change()
     valid = valid_rep_options()
@@ -776,12 +775,11 @@ def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
     idx = parsed.get("event_index")
     reply = (parsed.get("reply") or "").strip()
     if not isinstance(idx, int) or not 0 <= idx < len(events):
-        client.chat_postMessage(
-            channel=channel, thread_ts=thread_ts,
-            text=reply or "I couldn't tell which event you meant — include the event name "
-                          "and date and I'll update it.")
+        # Not an actionable rep-assignment change for a specific event — stay silent.
+        log.info("mention/DM not an actionable change; no response")
         return
 
+    _bot_threads.add((channel, thread_ts))         # engaged — follow the rest of this thread
     ev = events[idx]
     current = ev["reps"]
     remove = {r.strip().lower() for r in parsed.get("remove", [])}
