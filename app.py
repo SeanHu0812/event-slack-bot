@@ -414,6 +414,18 @@ def check_budget_modal(channel_id):
 # Slack handlers
 # ---------------------------------------------------------------------------
 
+def _bg(fn, *args):
+    """Run slow work off the Socket Mode dispatch path, so a long-running handler
+    never delays the next command/interaction. A blocked dispatch is what causes
+    Slack's 'expired_trigger_id' (the 3s trigger window lapses before views.open)."""
+    def run():
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("background task %s failed", getattr(fn, "__name__", fn))
+    threading.Thread(target=run, daemon=True).start()
+
+
 def create_and_reply(client, fields, ts, status):
     """Create the Notion page for a proposal and post the thread reply(s)."""
     url = create_notion_page(fields, ts)
@@ -485,49 +497,43 @@ def handle_confirmation(client, confirm_ts):
 
 @app.event("reaction_added")
 def on_reaction(event, client):
-    try:
-        item = event.get("item", {})
-        reaction, user = event.get("reaction"), event.get("user")
-        log.info("reaction_added: reaction=%r user=%r channel=%r type=%r",
-                 reaction, user, item.get("channel"), item.get("type"))
-        if item.get("channel") != CHANNEL or item.get("type") != "message":
-            return
-        if user not in APPROVERS:
-            log.info("skip: user %r not in approvers", user)
-            return
-        ts = item["ts"]
-        if reaction == APPROVE_EMOJI:
-            handle_approval(client, ts)
-        elif reaction == CONFIRM_EMOJI:
-            handle_confirmation(client, ts)
-    except Exception:
-        log.exception("failed handling reaction on %s", event.get("item", {}).get("ts"))
+    item = event.get("item", {})
+    reaction, user = event.get("reaction"), event.get("user")
+    log.info("reaction_added: reaction=%r user=%r channel=%r type=%r",
+             reaction, user, item.get("channel"), item.get("type"))
+    if item.get("channel") != CHANNEL or item.get("type") != "message":
+        return
+    if user not in APPROVERS:
+        return
+    ts = item["ts"]
+    if reaction == APPROVE_EMOJI:
+        _bg(handle_approval, client, ts)          # slow work off the dispatch path
+    elif reaction == CONFIRM_EMOJI:
+        _bg(handle_confirmation, client, ts)
 
 
 @app.event("message")
 def on_message(event, client):
     """Post a budget heads-up when a proposal is first sent in the channel."""
-    try:
-        if event.get("channel") != CHANNEL:
-            return
-        if event.get("subtype") or event.get("bot_id"):
-            return                                # edits, joins, bot messages
-        if event.get("thread_ts"):
-            return                                # only top-level messages
-        text = (event.get("text") or "").strip()
-        if len(text) < 20:                        # skip chatter
-            return
-        fields = parse_proposal(text)
-        if not fields.get("event") or not fields.get("date"):
-            return
-        status = budget_status(fields)
-        if not status:
-            return
-        client.chat_postMessage(
-            channel=CHANNEL, thread_ts=event["ts"], text=pre_approval_text(status))
-        log.info("posted pre-approval %s warning for %s", status["band"], event["ts"])
-    except Exception:
-        log.exception("failed handling message %s", event.get("ts"))
+    if event.get("channel") != CHANNEL:
+        return
+    if event.get("subtype") or event.get("bot_id") or event.get("thread_ts"):
+        return                                    # edits, joins, bot msgs, thread replies
+    text = (event.get("text") or "").strip()
+    if len(text) < 20:                            # skip chatter
+        return
+    _bg(_pre_approval_check, client, event["ts"], text)
+
+
+def _pre_approval_check(client, ts, text):
+    fields = parse_proposal(text)
+    if not fields.get("event") or not fields.get("date"):
+        return
+    status = budget_status(fields)
+    if not status:
+        return
+    client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=pre_approval_text(status))
+    log.info("posted pre-approval %s warning for %s", status["band"], ts)
 
 
 @app.command("/check-budget")
@@ -542,24 +548,25 @@ def cmd_check_budget(ack, body, client):
 
 @app.view("check_budget")
 def on_check_budget(ack, body, view, client):
-    ack()
-    try:
-        vals = view["state"]["values"]
-        locations = [o["value"] for o in vals["loc"]["v"]["selected_options"]]
-        months = [o["value"] for o in vals["months"]["v"]["selected_options"]]
-        text = build_budget_report(locations, months)
-        channel = view.get("private_metadata") or None
-        user = body["user"]["id"]
-        if channel:
-            try:
-                client.chat_postEphemeral(channel=channel, user=user, text=text)
-                return
-            except Exception:
-                log.warning("ephemeral post failed; DMing the report instead")
-        client.chat_postMessage(channel=user, text=text)
-        log.info("posted budget report for %s (%s / %s)", user, locations, months)
-    except Exception:
-        log.exception("failed to build/post budget report")
+    ack()                                         # close the modal immediately
+    vals = view["state"]["values"]
+    locations = [o["value"] for o in vals["loc"]["v"]["selected_options"]]
+    months = [o["value"] for o in vals["months"]["v"]["selected_options"]]
+    channel = view.get("private_metadata") or None
+    user = body["user"]["id"]
+    _bg(_send_budget_report, client, channel, user, locations, months)
+
+
+def _send_budget_report(client, channel, user, locations, months):
+    text = build_budget_report(locations, months)
+    if channel:
+        try:
+            client.chat_postEphemeral(channel=channel, user=user, text=text)
+            log.info("posted budget report for %s (%s / %s)", user, locations, months)
+            return
+        except Exception:
+            log.warning("ephemeral post failed; DMing the report instead")
+    client.chat_postMessage(channel=user, text=text)
 
 
 class _Health(BaseHTTPRequestHandler):
