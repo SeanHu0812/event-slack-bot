@@ -675,6 +675,27 @@ def build_my_events(slack_user_id):
 # ---------------------------------------------------------------------------
 
 _rep_options_cache = None
+_bot_threads = set()             # (channel, thread_root_ts) the bot is conversing in
+
+
+def thread_transcript(client, channel, thread_ts, msg_ts):
+    """Prior messages in the thread (labelled rep/bot) so follow-ups have context.
+    Empty for a brand-new thread (thread_ts == the current message)."""
+    if thread_ts == msg_ts:
+        return ""
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=30)["messages"]
+    except Exception:
+        return ""
+    lines = []
+    for m in msgs:
+        if m.get("ts") == msg_ts:
+            continue
+        who = "bot" if (m.get("bot_id") or m.get("user") == BOT_USER_ID) else "rep"
+        t = (m.get("text") or "").strip()
+        if t:
+            lines.append(f"{who}: {t}")
+    return "\n".join(lines[-12:])
 
 
 def valid_rep_options():
@@ -711,19 +732,22 @@ def upcoming_events_for_change():
     return evs
 
 
-def parse_assignment_change(text, requester_names, events, valid_opts):
+def parse_assignment_change(text, requester_names, events, valid_opts, context=""):
     """Ask Claude to pick the target event and the reps to add/remove. Returns
     {event_index, remove[], add[], reply}. event_index is null when ambiguous."""
     lines = [f"{i}: {e['date']} | {e['event']} | reps: {', '.join(e['reps']) or 'none'}"
              for i, e in enumerate(events)]
     who = ", ".join(sorted(requester_names)) if requester_names else "unknown (not in the rep list)"
+    convo = f"CONVERSATION SO FAR (oldest first):\n{context}\n\n" if context else ""
     prompt = (
-        "A Rho events rep sent a Slack message asking to change rep assignments for ONE "
+        "A Rho events rep is asking (in Slack) to change rep assignments for ONE "
         "upcoming event. Work out which event and what to change.\n"
         f"The sender is known in Notion as: {who}.\n"
         'Return ONLY JSON: {"event_index": <int or null>, "remove": [<names>], '
         '"add": [<names>], "reply": <string>}.\n'
         "Rules:\n"
+        "- Use the conversation so far (if any) to resolve follow-ups like 'the one on the "
+        "24th', 'yes', or 'the second one'.\n"
         "- event_index: index of the single event below the message refers to. If you "
         "cannot identify it confidently, or more than one plausibly matches, set null.\n"
         "- remove: reps to remove; if the sender refers to themselves (\"I\", \"me\", "
@@ -734,24 +758,26 @@ def parse_assignment_change(text, requester_names, events, valid_opts):
         "- reply: if event_index is null, or an add/remove can't be resolved, a short "
         "message asking the sender to clarify; otherwise an empty string.\n\n"
         f"VALID REPS: {valid_opts}\n\nUPCOMING EVENTS:\n" + "\n".join(lines) +
-        f"\n\nMESSAGE:\n{text}"
+        f"\n\n{convo}LATEST MESSAGE:\n{text}"
     )
     return ask_json(prompt)
 
 
-def handle_assignment_change(client, channel, ts, user, text):
+def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
         return
+    _bot_threads.add((channel, thread_ts))         # follow the rest of this thread
+    context = thread_transcript(client, channel, thread_ts, msg_ts)
     events = upcoming_events_for_change()
     valid = valid_rep_options()
     requester = {n for n, sid in rep_map().items() if sid == user}
-    parsed = parse_assignment_change(text, requester, events, valid)
+    parsed = parse_assignment_change(text, requester, events, valid, context)
     idx = parsed.get("event_index")
     reply = (parsed.get("reply") or "").strip()
     if not isinstance(idx, int) or not 0 <= idx < len(events):
         client.chat_postMessage(
-            channel=channel, thread_ts=ts,
+            channel=channel, thread_ts=thread_ts,
             text=reply or "I couldn't tell which event you meant — include the event name "
                           "and date and I'll update it.")
         return
@@ -772,7 +798,7 @@ def handle_assignment_change(client, channel, ts, user, text):
     if set(new) == set(current):
         note = f" (couldn't find in the rep list: {', '.join(invalid)})" if invalid else ""
         client.chat_postMessage(
-            channel=channel, thread_ts=ts,
+            channel=channel, thread_ts=thread_ts,
             text=(reply or f"No changes made to *{ev['event']}* ({fmt_day(ev['date'])}).") + note)
         return
 
@@ -788,7 +814,7 @@ def handle_assignment_change(client, channel, ts, user, text):
     parts.append("Reps now: " + (", ".join(rep_mention(n, mapping) for n in new) or "none"))
     if invalid:
         parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
-    client.chat_postMessage(channel=channel, thread_ts=ts, text="\n".join(parts))
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
     log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
 
 
@@ -902,29 +928,39 @@ def on_reaction(event, client):
 @app.event("app_mention")
 def on_app_mention(event, client):
     """A rep @-mentioned the bot with a rep-assignment change."""
-    _bg(handle_assignment_change, client, event["channel"], event["ts"],
+    root = event.get("thread_ts") or event["ts"]
+    _bg(handle_assignment_change, client, event["channel"], root, event["ts"],
         event.get("user"), event.get("text", ""))
 
 
 @app.event("message")
 def on_message(event, client):
-    if event.get("subtype") or event.get("bot_id") or event.get("thread_ts"):
-        return                                    # edits, joins, bot msgs, thread replies
+    if event.get("subtype") or event.get("bot_id"):
+        return                                    # edits, joins, bot messages
+    channel, user = event.get("channel"), event.get("user")
+    ts, thread_ts = event.get("ts"), event.get("thread_ts")
     text = (event.get("text") or "").strip()
-    # A DM to the bot is a rep-assignment change request.
+
+    # A DM to the bot is a rep-assignment change request (incl. thread replies).
     if event.get("channel_type") == "im":
         if len(text) >= 3:
-            _bg(handle_assignment_change, client, event["channel"], event["ts"],
-                event.get("user"), text)
+            _bg(handle_assignment_change, client, channel, thread_ts or ts, ts, user, text)
         return
-    # Otherwise: only the community channel, for the proposal budget heads-up.
-    if event.get("channel") != CHANNEL:
-        return
+
+    # Channel @mentions are handled by on_app_mention (avoid double-processing).
     if BOT_USER_ID and f"<@{BOT_USER_ID}>" in text:
-        return                                    # an @mention — on_app_mention handles it
+        return
+    # A reply in a thread the bot is already conversing in — continue it.
+    if thread_ts:
+        if (channel, thread_ts) in _bot_threads:
+            _bg(handle_assignment_change, client, channel, thread_ts, ts, user, text)
+        return
+    # Top-level community-channel message — proposal budget heads-up.
+    if channel != CHANNEL:
+        return
     if len(text) < 20:                            # skip chatter
         return
-    _bg(_pre_approval_check, client, event["ts"], text)
+    _bg(_pre_approval_check, client, ts, text)
 
 
 def _pre_approval_check(client, ts, text):

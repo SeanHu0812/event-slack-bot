@@ -63,6 +63,10 @@ a rep to add must already exist in the `Reps` options (no junk options are creat
 "me/I" resolves to the sender via `REP_MAP_CSV`; if the event is ambiguous or a name can't
 be resolved, the bot asks to clarify instead of writing.
 
+The conversation can continue **in-thread**: once the bot has replied in a thread (or been
+@mentioned in one), a rep's follow-up replies there — with no new @mention — are picked up
+too, and prior thread messages are given to Claude so "the one on the 24th" / "yes" resolve.
+
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
 - **Non-proposal** (a link, a photo, no event name) → parse returns no event, bot stays silent.
