@@ -763,7 +763,8 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         f"VALID REPS: {valid_opts}\n\nUPCOMING EVENTS (index | date | city | event | reps):\n"
         + "\n".join(lines) + f"\n\n{convo}LATEST MESSAGE:\n{text}"
     )
-    return ask_json(prompt)
+    # Generous budget: answers can list many events across multiple matching reps.
+    return ask_json(prompt, max_tokens=2000)
 
 
 def handle_mention(client, channel, thread_ts, msg_ts, user, text):
