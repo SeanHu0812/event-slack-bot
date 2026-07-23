@@ -16,12 +16,27 @@ No DMs, no other output.
 4. Parses the free-text proposal into clean JSON with one Anthropic call.
 5. Creates the Notion page (title + date + city/partner/cost/invite link + dedup marker).
 
+### Budget warnings (NYC & SF only)
+The bot cross-checks proposal cost against the monthly budget in a Google Sheet
+(`Cost Analysis Per Month` table on the NYC and SF tabs; `Monthly Budget` cap per tab).
+`projected = that month's Estimated + this event's cost`, compared to the Monthly Budget:
+
+- **When a proposal is posted** in the channel, if `projected` is ≥90% of budget the bot
+  posts a heads-up in-thread (a bigger warning at ≥100%).
+- **When approved**, if it stays under 100% the page is created and (at 90–99%) a
+  "you have $X left" note is posted.
+- **When approving would push the month to ≥100%**, the bot does **not** create the page.
+  It posts a confirmation with a ✅; only when an approver clicks the ✅ is the page created.
+
+Only NYC and SF have budgets — other cities are created normally with no budget check.
+If the Google credentials aren't configured, budget checks are skipped entirely.
+
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
 - **Non-proposal** (a link, a photo, no event name) → parse returns no event, bot stays silent.
 - **No / TBD date** → replies in-thread asking for manual entry, creates no page.
 - **City not in the valid list** → omits the `City` property instead of inventing an option.
-- **Notion or Slack API error** → logged; the process does not crash and the websocket stays up.
+- **Notion / Slack / Sheets API error** → logged; the process does not crash and the websocket stays up.
 
 ## Setup
 
@@ -32,14 +47,27 @@ No DMs, no other output.
    - `SLACK_APP_TOKEN` — the `xapp-` app-level token (Socket Mode, `connections:write`)
    - `NOTION_TOKEN` — the `ntn_` integration secret (integration must be shared with the DB)
    - `ANTHROPIC_API_KEY` — the `sk-ant-` key
+   - `GOOGLE_SERVICE_ACCOUNT_JSON` — *(optional)* service-account key JSON for budget
+     checks; omit to disable budget warnings
 4. Run: `python app.py`
 
-## Slack app config (already done)
+## Slack app config
 
 - Socket Mode enabled → `xapp-` app-level token with `connections:write`.
-- Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`.
-- Event subscription: bot event `reaction_added`.
+- Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
+  **`reactions:write`** (to seed the ✅ on over-budget confirmations).
+- Event subscriptions (bot events): `reaction_added`, **`message.channels`**
+  (to see proposals when they're posted).
 - Bot invited to #community-team (`/invite @your-bot`).
+- **Reinstall the app** after changing scopes or event subscriptions.
+
+## Budget sheet config (Google service account)
+
+- Create a Google Cloud service account, enable the Google Sheets API, and download its
+  JSON key. Put the key (full JSON on one line, or its base64) in `GOOGLE_SERVICE_ACCOUNT_JSON`.
+- **Share the budget spreadsheet** with the service account's `client_email` (Viewer).
+- Tab titles must be `NYC` and `SF`; each needs a `Monthly Budget` cell and a
+  `Cost Analysis Per Month` table (Month / Estimated columns).
 
 ## Notion config (already done)
 
