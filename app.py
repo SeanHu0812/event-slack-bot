@@ -28,6 +28,7 @@ DB_ID         = "5acc7ada733042a3ace3433f828455b6"   # 2026 Events & Community C
 
 # Budget Google Sheet ("2026 Events" budget tracker).
 SPREADSHEET_ID = "1F_IwoL1yixzOR0BVViII1LgBlYzVehO2s2rnbyfBCOc"
+BUDGET_YEAR = 2026               # months offered by /check-budget
 # Only these cities have a budget tab; map city -> worksheet (tab) title.
 BUDGET_TABS = {"NYC": "NYC", "SF": "SF"}
 WARN_THRESHOLD = 0.90            # 90-99% -> warning, >=100% -> over-budget
@@ -379,15 +380,10 @@ def _options(values):
 
 
 def month_options():
-    """Month choices for the modal — from the sheet if reachable, else 2026 months."""
-    labels = []
-    try:
-        _, table = budget_table("NYC")
-        labels = [m for m in table if m.lower() != "other / out of range"]
-    except Exception:
-        log.warning("could not read months from sheet; using default 2026 list")
-    if not labels:
-        labels = [datetime(2026, i, 1).strftime("%b %Y") for i in range(1, 13)]
+    """Month choices for the modal. Network-free on purpose: a slash command's
+    trigger_id expires in ~3s, so views.open must not wait on a sheet fetch.
+    The report itself reads live sheet data at submission time."""
+    labels = [datetime(BUDGET_YEAR, i, 1).strftime("%b %Y") for i in range(1, 13)]
     return _options(labels)
 
 

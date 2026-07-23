@@ -33,7 +33,8 @@ If the Google credentials aren't configured, budget checks are skipped entirely.
 
 ### `/check-budget` command
 Type `/check-budget` to open a modal with two multi-selects — **Location** (NYC/SF) and
-**Months** (pulled live from the sheet). On submit, the bot posts a spending report
+**Months** (the 12 months of the budget year). On submit, the bot reads the sheet live
+and posts a spending report
 (Estimated & Actual vs Monthly Budget per month, plus a multi-month total) as an
 ephemeral message visible only to you.
 
