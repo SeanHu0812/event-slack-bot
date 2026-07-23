@@ -37,3 +37,9 @@ args = "python app.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[userenv]
+
+[userenv.shared]
+BUDGET_CSV_NYC = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ82cDJbBKC7mXDEo4q0UMtyaNolNIWUnE-CQsM7ZbANNLhNPQasED_ykfyY5x7RorwYMkYljbxgkWn/pub?gid=227849508&single=true&output=csv"
+BUDGET_CSV_SF = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ82cDJbBKC7mXDEo4q0UMtyaNolNIWUnE-CQsM7ZbANNLhNPQasED_ykfyY5x7RorwYMkYljbxgkWn/pub?gid=1231143055&single=true&output=csv"
