@@ -52,6 +52,8 @@ DREW_ID = "U037HBMJBHU"                  # reps-assignment owner, DMed when reps
 DONE_EMOJI = "done"                      # Drew reacts this to release the rundown
 REPS_REMINDER_SENTINEL = "Reps assignment are missing"
 MY_EVENTS_HORIZON_DAYS = 60              # how far ahead /my-event looks
+ASSIGN_HORIZON_DAYS = 90                 # how far ahead @-mention reassignments can reach
+BOT_USER_ID = None                       # resolved at startup, to ignore our own @mentions
 
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -80,6 +82,26 @@ def to_number(v):
         return None
 
 
+def ask_json(prompt, max_tokens=700):
+    """Call Claude and parse its reply as JSON. Returns {} on failure. Skips any
+    non-text (e.g. extended-thinking) blocks and strips code fences."""
+    out = claude.messages.create(
+        model="claude-sonnet-5", max_tokens=max_tokens,
+        system="You output only valid JSON. No prose, no markdown fences.",
+        messages=[{"role": "user", "content": prompt}])
+    raw = "".join(b.text for b in out.content if b.type == "text").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("could not parse model output as JSON: %r", raw)
+        return {}
+
+
 def parse_proposal(text):
     """Extract event fields from a free-text proposal. Returns a dict with an
     'event' key that is None when the message is not actually a proposal."""
@@ -101,22 +123,7 @@ def parse_proposal(text):
         "If the message is not an event proposal, set event to null.\n\n"
         f"MESSAGE:\n{text}"
     )
-    out = claude.messages.create(
-        model="claude-sonnet-5", max_tokens=500,
-        system="You output only valid JSON. No prose, no markdown fences.",
-        messages=[{"role": "user", "content": prompt}])
-    # Skip any non-text blocks (e.g. extended-thinking blocks) and join text.
-    raw = "".join(b.text for b in out.content if b.type == "text").strip()
-    if raw.startswith("```"):                      # strip code fences if present
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        log.warning("could not parse model output as JSON: %r", raw)
-        return {"event": None}
+    return ask_json(prompt, max_tokens=500) or {"event": None}
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +669,128 @@ def build_my_events(slack_user_id):
 
 
 # ---------------------------------------------------------------------------
+# @-mention / DM rep-assignment changes (writes to Notion)
+# ---------------------------------------------------------------------------
+
+_rep_options_cache = None
+
+
+def valid_rep_options():
+    """All names configured in the Notion Reps multi-select (cached).
+    Used to keep reassignments from creating junk options (like City)."""
+    global _rep_options_cache
+    if _rep_options_cache is None:
+        ds = notion.data_sources.retrieve(data_source_id=data_source_id())
+        _rep_options_cache = [o["name"] for o in ds["properties"]["Reps"]["multi_select"]["options"]]
+    return _rep_options_cache
+
+
+def upcoming_events_for_change():
+    """Upcoming events (any city, next ASSIGN_HORIZON_DAYS) that may be edited."""
+    today = datetime.now(RUNDOWN_TZ).date()
+    end = today + timedelta(days=ASSIGN_HORIZON_DAYS)
+    pages = _query_all(
+        {"and": [
+            {"property": "Date", "date": {"on_or_after": today.isoformat()}},
+            {"property": "Date", "date": {"on_or_before": end.isoformat()}},
+        ]},
+        [{"property": "Date", "direction": "ascending"}])
+    evs = []
+    for p in pages:
+        pr = p["properties"]
+        name = _plain(pr["Event"]["title"]).strip()
+        if not name or name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
+            continue
+        d = (pr.get("Date") or {}).get("date") or {}
+        if not d.get("start"):
+            continue
+        evs.append({"id": p["id"], "event": name, "date": d["start"][:10],
+                    "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])]})
+    return evs
+
+
+def parse_assignment_change(text, requester_names, events, valid_opts):
+    """Ask Claude to pick the target event and the reps to add/remove. Returns
+    {event_index, remove[], add[], reply}. event_index is null when ambiguous."""
+    lines = [f"{i}: {e['date']} | {e['event']} | reps: {', '.join(e['reps']) or 'none'}"
+             for i, e in enumerate(events)]
+    who = ", ".join(sorted(requester_names)) if requester_names else "unknown (not in the rep list)"
+    prompt = (
+        "A Rho events rep sent a Slack message asking to change rep assignments for ONE "
+        "upcoming event. Work out which event and what to change.\n"
+        f"The sender is known in Notion as: {who}.\n"
+        'Return ONLY JSON: {"event_index": <int or null>, "remove": [<names>], '
+        '"add": [<names>], "reply": <string>}.\n'
+        "Rules:\n"
+        "- event_index: index of the single event below the message refers to. If you "
+        "cannot identify it confidently, or more than one plausibly matches, set null.\n"
+        "- remove: reps to remove; if the sender refers to themselves (\"I\", \"me\", "
+        "\"can't make it\") include the sender's Notion name(s). Use names exactly as they "
+        "appear in that event's current reps.\n"
+        "- add: reps to add, using names EXACTLY as they appear in VALID REPS. Never invent "
+        "a name that isn't in that list.\n"
+        "- reply: if event_index is null, or an add/remove can't be resolved, a short "
+        "message asking the sender to clarify; otherwise an empty string.\n\n"
+        f"VALID REPS: {valid_opts}\n\nUPCOMING EVENTS:\n" + "\n".join(lines) +
+        f"\n\nMESSAGE:\n{text}"
+    )
+    return ask_json(prompt)
+
+
+def handle_assignment_change(client, channel, ts, user, text):
+    text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
+    if not text:
+        return
+    events = upcoming_events_for_change()
+    valid = valid_rep_options()
+    requester = {n for n, sid in rep_map().items() if sid == user}
+    parsed = parse_assignment_change(text, requester, events, valid)
+    idx = parsed.get("event_index")
+    reply = (parsed.get("reply") or "").strip()
+    if not isinstance(idx, int) or not 0 <= idx < len(events):
+        client.chat_postMessage(
+            channel=channel, thread_ts=ts,
+            text=reply or "I couldn't tell which event you meant — include the event name "
+                          "and date and I'll update it.")
+        return
+
+    ev = events[idx]
+    current = ev["reps"]
+    remove = {r.strip().lower() for r in parsed.get("remove", [])}
+    by_lower = {v.lower(): v for v in valid}
+    add, invalid = [], []
+    for a in parsed.get("add", []):
+        canon = a if a in valid else by_lower.get(a.strip().lower())
+        (add if canon else invalid).append(canon or a)
+    new = [r for r in current if r.strip().lower() not in remove]
+    for a in add:
+        if a not in new:
+            new.append(a)
+
+    if set(new) == set(current):
+        note = f" (couldn't find in the rep list: {', '.join(invalid)})" if invalid else ""
+        client.chat_postMessage(
+            channel=channel, thread_ts=ts,
+            text=(reply or f"No changes made to *{ev['event']}* ({fmt_day(ev['date'])}).") + note)
+        return
+
+    notion.pages.update(page_id=ev["id"],
+                        properties={"Reps": {"multi_select": [{"name": n} for n in new]}})
+    mapping = rep_map()
+    removed = [r for r in current if r.strip().lower() in remove]
+    parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
+    if removed:
+        parts.append("Removed: " + ", ".join(rep_mention(r, mapping) for r in removed))
+    if add:
+        parts.append("Added: " + ", ".join(rep_mention(a, mapping) for a in add))
+    parts.append("Reps now: " + (", ".join(rep_mention(n, mapping) for n in new) or "none"))
+    if invalid:
+        parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
+    client.chat_postMessage(channel=channel, thread_ts=ts, text="\n".join(parts))
+    log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
+
+
+# ---------------------------------------------------------------------------
 # Slack handlers
 # ---------------------------------------------------------------------------
 
@@ -768,14 +897,29 @@ def on_reaction(event, client):
         _bg(handle_confirmation, client, ts)
 
 
+@app.event("app_mention")
+def on_app_mention(event, client):
+    """A rep @-mentioned the bot with a rep-assignment change."""
+    _bg(handle_assignment_change, client, event["channel"], event["ts"],
+        event.get("user"), event.get("text", ""))
+
+
 @app.event("message")
 def on_message(event, client):
-    """Post a budget heads-up when a proposal is first sent in the channel."""
-    if event.get("channel") != CHANNEL:
-        return
     if event.get("subtype") or event.get("bot_id") or event.get("thread_ts"):
         return                                    # edits, joins, bot msgs, thread replies
     text = (event.get("text") or "").strip()
+    # A DM to the bot is a rep-assignment change request.
+    if event.get("channel_type") == "im":
+        if len(text) >= 3:
+            _bg(handle_assignment_change, client, event["channel"], event["ts"],
+                event.get("user"), text)
+        return
+    # Otherwise: only the community channel, for the proposal budget heads-up.
+    if event.get("channel") != CHANNEL:
+        return
+    if BOT_USER_ID and f"<@{BOT_USER_ID}>" in text:
+        return                                    # an @mention — on_app_mention handles it
     if len(text) < 20:                            # skip chatter
         return
     _bg(_pre_approval_check, client, event["ts"], text)
@@ -879,6 +1023,11 @@ def start_health_server():
 
 if __name__ == "__main__":
     log.info("events-bot starting (socket mode)")
+    try:
+        BOT_USER_ID = app.client.auth_test()["user_id"]
+        log.info("bot user id resolved: %s", BOT_USER_ID)
+    except Exception:
+        log.warning("could not resolve bot user id")
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=weekly_scheduler, args=(app.client,), daemon=True).start()
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()

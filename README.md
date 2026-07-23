@@ -54,6 +54,15 @@ shows the current rundown to whoever runs it (ephemeral).
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
 the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet it says so.
 
+### Rep-assignment changes (@mention or DM)
+A rep can **@mention the bot** in a channel, or **DM it**, in plain language
+("I can't make the Founder Dinner on the 28th, Marc is covering"). Claude picks the single
+matching upcoming event and the reps to add/remove, and the bot **updates the Notion
+`Reps`** field, then replies with exactly what changed. Guardrails: only upcoming events;
+a rep to add must already exist in the `Reps` options (no junk options are created);
+"me/I" resolves to the sender via `REP_MAP_CSV`; if the event is ambiguous or a name can't
+be resolved, the bot asks to clarify instead of writing.
+
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
 - **Non-proposal** (a link, a photo, no event name) → parse returns no event, bot stays silent.
@@ -79,8 +88,10 @@ the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet 
 - Socket Mode enabled → `xapp-` app-level token with `connections:write`.
 - Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
   **`reactions:write`** (seed ✅/:done: reactions), **`commands`** (slash commands),
-  **`im:write`** + **`im:history`** (DM Drew and read his `:done:` reply).
-- Event subscriptions (bot events): `reaction_added`, **`message.channels`**.
+  **`im:write`** + **`im:history`** (DM Drew / accept rep DMs), **`app_mentions:read`**
+  (accept @mentions).
+- Event subscriptions (bot events): `reaction_added`, `message.channels`,
+  **`app_mention`**, **`message.im`**.
 - Slash commands created (Features → Slash Commands): **`/check-budget`**,
   **`/events-this-week`**, **`/my-event`**. In Socket Mode no Request URL is needed.
 - Bot invited to #community-team, **#ny-vc-squad**, and **#qualifiers-across-department**
