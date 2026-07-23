@@ -31,6 +31,12 @@ The bot cross-checks proposal cost against the monthly budget in a Google Sheet
 Only NYC and SF have budgets — other cities are created normally with no budget check.
 If the Google credentials aren't configured, budget checks are skipped entirely.
 
+### `/check-budget` command
+Type `/check-budget` to open a modal with two multi-selects — **Location** (NYC/SF) and
+**Months** (pulled live from the sheet). On submit, the bot posts a spending report
+(Estimated & Actual vs Monthly Budget per month, plus a multi-month total) as an
+ephemeral message visible only to you.
+
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
 - **Non-proposal** (a link, a photo, no event name) → parse returns no event, bot stays silent.
@@ -55,11 +61,14 @@ If the Google credentials aren't configured, budget checks are skipped entirely.
 
 - Socket Mode enabled → `xapp-` app-level token with `connections:write`.
 - Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
-  **`reactions:write`** (to seed the ✅ on over-budget confirmations).
+  **`reactions:write`** (to seed the ✅ on over-budget confirmations),
+  **`commands`** (for the `/check-budget` slash command).
 - Event subscriptions (bot events): `reaction_added`, **`message.channels`**
   (to see proposals when they're posted).
+- Slash command **`/check-budget`** created (Features → Slash Commands). In Socket Mode
+  no Request URL is needed.
 - Bot invited to #community-team (`/invite @your-bot`).
-- **Reinstall the app** after changing scopes or event subscriptions.
+- **Reinstall the app** after changing scopes, events, or commands.
 
 ## Budget sheet config
 

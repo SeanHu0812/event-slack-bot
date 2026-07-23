@@ -209,15 +209,15 @@ def _money(s):
         return None
 
 
-def read_budget(tab, month):
-    """Read (monthly_budget, estimated_allocated_for_month) from a city tab.
-    `month` is formatted like 'Sep 2026'. Locates cells by content so it is
-    robust to the exact column the analysis panel sits in."""
+def budget_table(tab):
+    """Return (monthly_budget, {month: {'estimated': float, 'actual': float}})
+    for a city tab. Locates cells by content, so it is robust to the exact
+    column the analysis panel sits in."""
     grid = load_grid(tab)
     if not grid:
-        return None, None
+        return None, {}
 
-    # 1) Monthly Budget: the value to the right of a "Monthly Budget" label cell.
+    # Monthly Budget: the value to the right of a "Monthly Budget" label cell.
     budget = None
     for row in grid:
         for i, cell in enumerate(row):
@@ -230,32 +230,41 @@ def read_budget(tab, month):
         if budget is not None:
             break
 
-    # 2) Estimated for the month: from the "Cost Analysis Per Month" table.
-    estimated = 0.0
+    # The "Cost Analysis Per Month" table: month -> estimated / actual.
+    months = {}
     for r_idx, row in enumerate(grid):
         if not any(cell.strip() == "Cost Analysis Per Month" for cell in row):
             continue
         header = grid[r_idx + 1] if r_idx + 1 < len(grid) else []
-        month_col = est_col = None
+        col = {}
         for ci, cell in enumerate(header):
             t = cell.strip().lower()
-            if t == "month":
-                month_col = ci
-            elif t == "estimated":
-                est_col = ci
-        if month_col is None or est_col is None:
+            if t in ("month", "estimated", "actual"):
+                col[t] = ci
+        if "month" not in col or "estimated" not in col:
             continue
         for data in grid[r_idx + 2:]:
-            if month_col >= len(data):
+            if col["month"] >= len(data):
                 continue
-            m = data[month_col].strip()
-            if m == month:
-                estimated = _money(data[est_col]) or 0.0
-                break
+            m = data[col["month"]].strip()
+            if not m:
+                continue
             if m.upper() == "TOTAL":
                 break
+            est_ci, act_ci = col["estimated"], col.get("actual")
+            est = _money(data[est_ci]) if est_ci < len(data) else None
+            act = _money(data[act_ci]) if act_ci is not None and act_ci < len(data) else None
+            months[m] = {"estimated": est or 0.0, "actual": act or 0.0}
         break
-    return budget, estimated
+    return budget, months
+
+
+def read_budget(tab, month):
+    """(monthly_budget, estimated_for_month) — used by the live budget checks."""
+    budget, months = budget_table(tab)
+    if not budget:
+        return None, None
+    return budget, months.get(month, {}).get("estimated", 0.0)
 
 
 def budget_status(fields):
@@ -318,6 +327,90 @@ def confirmation_text(s):
     return (f":rotating_light: *WARNING:* Approving this will put {s['city']} over the "
             f"{s['month']} budget (${s['projected']:,.0f} / ${s['budget']:,.0f}, {s['pct']}%).\n"
             f"React :white_check_mark: to {CONFIRM_SENTINEL} anyway.")
+
+
+# ---------------------------------------------------------------------------
+# /check-budget slash command
+# ---------------------------------------------------------------------------
+
+def _month_key(m):
+    try:
+        return datetime.strptime(m, "%b %Y")
+    except ValueError:
+        return datetime.max
+
+
+def build_budget_report(locations, months):
+    """Assemble a spending report for the selected cities and months."""
+    if not locations or not months:
+        return "Please pick at least one location and one month."
+    months = sorted(months, key=_month_key)
+    lines = [":bar_chart: *Budget report*"]
+    for city in locations:
+        lines.append(f"\n*{city}*")
+        tab = BUDGET_TABS.get(city)
+        if not tab:
+            lines.append("• no budget tracked for this location")
+            continue
+        budget, table = budget_table(tab)
+        if not budget:
+            lines.append("• couldn't read the budget sheet")
+            continue
+        tot_est = tot_act = 0.0
+        for m in months:
+            row = table.get(m, {})
+            est, act = row.get("estimated", 0.0), row.get("actual", 0.0)
+            tot_est += est
+            tot_act += act
+            lines.append(
+                f"• {m} — Est ${est:,.0f} / ${budget:,.0f} ({est / budget * 100:.0f}%)"
+                f" · Act ${act:,.0f} ({act / budget * 100:.0f}%)")
+        if len(months) > 1:
+            cap = budget * len(months)
+            lines.append(
+                f"  _Total ({len(months)} mo)_ — Est ${tot_est:,.0f} / ${cap:,.0f}"
+                f" ({tot_est / cap * 100:.0f}%) · Act ${tot_act:,.0f}")
+    return "\n".join(lines)
+
+
+def _options(values):
+    return [{"text": {"type": "plain_text", "text": v}, "value": v} for v in values]
+
+
+def month_options():
+    """Month choices for the modal — from the sheet if reachable, else 2026 months."""
+    labels = []
+    try:
+        _, table = budget_table("NYC")
+        labels = [m for m in table if m.lower() != "other / out of range"]
+    except Exception:
+        log.warning("could not read months from sheet; using default 2026 list")
+    if not labels:
+        labels = [datetime(2026, i, 1).strftime("%b %Y") for i in range(1, 13)]
+    return _options(labels)
+
+
+def check_budget_modal(channel_id):
+    return {
+        "type": "modal",
+        "callback_id": "check_budget",
+        "private_metadata": channel_id or "",
+        "title": {"type": "plain_text", "text": "Check Budget"},
+        "submit": {"type": "plain_text", "text": "Run report"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {"type": "input", "block_id": "loc",
+             "label": {"type": "plain_text", "text": "Location"},
+             "element": {"type": "multi_static_select", "action_id": "v",
+                         "placeholder": {"type": "plain_text", "text": "Select location(s)"},
+                         "options": _options(list(BUDGET_TABS))}},
+            {"type": "input", "block_id": "months",
+             "label": {"type": "plain_text", "text": "Months"},
+             "element": {"type": "multi_static_select", "action_id": "v",
+                         "placeholder": {"type": "plain_text", "text": "Select month(s)"},
+                         "options": month_options()}},
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +531,38 @@ def on_message(event, client):
         log.info("posted pre-approval %s warning for %s", status["band"], event["ts"])
     except Exception:
         log.exception("failed handling message %s", event.get("ts"))
+
+
+@app.command("/check-budget")
+def cmd_check_budget(ack, body, client):
+    ack()
+    try:
+        client.views_open(trigger_id=body["trigger_id"],
+                          view=check_budget_modal(body.get("channel_id")))
+    except Exception:
+        log.exception("failed to open check-budget modal")
+
+
+@app.view("check_budget")
+def on_check_budget(ack, body, view, client):
+    ack()
+    try:
+        vals = view["state"]["values"]
+        locations = [o["value"] for o in vals["loc"]["v"]["selected_options"]]
+        months = [o["value"] for o in vals["months"]["v"]["selected_options"]]
+        text = build_budget_report(locations, months)
+        channel = view.get("private_metadata") or None
+        user = body["user"]["id"]
+        if channel:
+            try:
+                client.chat_postEphemeral(channel=channel, user=user, text=text)
+                return
+            except Exception:
+                log.warning("ephemeral post failed; DMing the report instead")
+        client.chat_postMessage(channel=user, text=text)
+        log.info("posted budget report for %s (%s / %s)", user, locations, months)
+    except Exception:
+        log.exception("failed to build/post budget report")
 
 
 if __name__ == "__main__":
