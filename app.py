@@ -44,8 +44,10 @@ VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segu
 RUNDOWN_TZ = ZoneInfo("America/New_York")
 RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
-# Channel IDs to post the rundown to (comma-separated env var; bot must be invited).
-RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get("RUNDOWN_CHANNELS", "").split(",") if c.strip()]
+# Channel IDs to post the rundown to (bot must be invited to each).
+# Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
+RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
+    "RUNDOWN_CHANNELS", "C077WPGU528,C08KPMCU6P9").split(",") if c.strip()]
 DREW_ID = "U037HBMJBHU"                  # reps-assignment owner, DMed when reps are missing
 DONE_EMOJI = "done"                      # Drew reacts this to release the rundown
 REPS_REMINDER_SENTINEL = "Reps assignment are missing"
