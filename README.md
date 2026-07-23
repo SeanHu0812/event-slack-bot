@@ -54,11 +54,18 @@ shows the current rundown to whoever runs it (ephemeral).
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
 the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet it says so.
 
-### Rep-assignment changes (@mention or DM)
-A rep can **@mention the bot** in a channel, or **DM it**, in plain language
-("I can't make the Founder Dinner on the 28th, Marc is covering"). Claude picks the single
-matching upcoming event and the reps to add/remove, and the bot **updates the Notion
-`Reps`** field, then replies with exactly what changed. Guardrails: only upcoming events;
+### Rep-assignment Q&A and changes (@mention or DM)
+A rep can **@mention the bot** in a channel, or **DM it**, in plain language. The bot
+classifies each message as a **question**, a **change**, or neither:
+
+- **Question** ("what upcoming events is Lavar Buckmon on?", "who's assigned to the Founder
+  Dinner on the 28th?", "how many events do I have next week?") → the bot answers from the
+  Notion event data.
+- **Change** ("I can't make the Founder Dinner on the 28th, Marc is covering") → Claude picks
+  the single matching upcoming event and the reps to add/remove, the bot **updates the Notion
+  `Reps`** field, then replies with exactly what changed.
+- **Neither** (greetings, chit-chat, or a request it can't tie to a specific event) → the
+  bot stays silent. Guardrails: only upcoming events;
 a rep to add must already exist in the `Reps` options (no junk options are created);
 "me/I" resolves to the sender via `REP_MAP_CSV`; if the event is ambiguous or a name can't
 be resolved, the bot asks to clarify instead of writing.

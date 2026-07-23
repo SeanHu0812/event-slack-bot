@@ -728,42 +728,45 @@ def upcoming_events_for_change():
         if not d.get("start"):
             continue
         evs.append({"id": p["id"], "event": name, "date": d["start"][:10],
+                    "city": (pr.get("City", {}).get("select") or {}).get("name"),
                     "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])]})
     return evs
 
 
-def parse_assignment_change(text, requester_names, events, valid_opts, context=""):
-    """Ask Claude to pick the target event and the reps to add/remove. Returns
-    {event_index, remove[], add[], reply}. event_index is null when ambiguous."""
-    lines = [f"{i}: {e['date']} | {e['event']} | reps: {', '.join(e['reps']) or 'none'}"
-             for i, e in enumerate(events)]
+def parse_mention(text, requester_names, events, valid_opts, context=""):
+    """Classify a rep's message to the bot and produce response data:
+    {intent: change|question|none, event_index, remove[], add[], answer}."""
+    lines = [f"{i}: {e['date']} | {e.get('city') or '?'} | {e['event']} | "
+             f"reps: {', '.join(e['reps']) or 'none'}" for i, e in enumerate(events)]
     who = ", ".join(sorted(requester_names)) if requester_names else "unknown (not in the rep list)"
     convo = f"CONVERSATION SO FAR (oldest first):\n{context}\n\n" if context else ""
     prompt = (
-        "A Rho events rep is asking (in Slack) to change rep assignments for ONE "
-        "upcoming event. Work out which event and what to change.\n"
+        "A Rho events rep sent a Slack message to the events bot. Decide what they want.\n"
         f"The sender is known in Notion as: {who}.\n"
-        'Return ONLY JSON: {"event_index": <int or null>, "remove": [<names>], '
-        '"add": [<names>], "reply": <string>}.\n'
-        "Rules:\n"
-        "- Use the conversation so far (if any) to resolve follow-ups like 'the one on the "
-        "24th', 'yes', or 'the second one'.\n"
-        "- event_index: index of the single event below the message refers to. If you "
-        "cannot identify it confidently, or more than one plausibly matches, set null.\n"
-        "- remove: reps to remove; if the sender refers to themselves (\"I\", \"me\", "
-        "\"can't make it\") include the sender's Notion name(s). Use names exactly as they "
-        "appear in that event's current reps.\n"
-        "- add: reps to add, using names EXACTLY as they appear in VALID REPS. Never invent "
-        "a name that isn't in that list.\n"
-        "- reply: if event_index is null, or an add/remove can't be resolved, a short "
-        "message asking the sender to clarify; otherwise an empty string.\n\n"
-        f"VALID REPS: {valid_opts}\n\nUPCOMING EVENTS:\n" + "\n".join(lines) +
-        f"\n\n{convo}LATEST MESSAGE:\n{text}"
+        'Return ONLY JSON: {"intent": "change"|"question"|"none", "event_index": <int or '
+        'null>, "remove": [<names>], "add": [<names>], "answer": <string>}.\n'
+        "Intents:\n"
+        "- \"change\": modify rep assignments for ONE event. Set event_index to that event's "
+        "index below (null if unclear/ambiguous) and fill remove/add. Leave answer empty.\n"
+        "- \"question\": they are ASKING about events or assignments (who is on an event, what "
+        "someone is assigned to, how many, when, etc.). Put a concise Slack-formatted answer in "
+        "'answer', computed ONLY from the UPCOMING EVENTS below; list events as "
+        "'• <date> — <event>'. If nothing matches, say so plainly. Leave the change fields empty.\n"
+        "- \"none\": anything else (greetings, chit-chat, unrelated). All fields empty.\n"
+        "Change rules:\n"
+        "- Use the conversation so far to resolve follow-ups ('the one on the 24th', 'yes').\n"
+        "- remove: if the sender refers to themselves ('I','me','can't make it') include their "
+        "Notion name(s); use names exactly as they appear in that event's current reps.\n"
+        "- add: names EXACTLY as in VALID REPS; never invent a name.\n"
+        "Notion rep names may be short forms (e.g. 'Lavar' == 'Lavar Buckmon'); match sensibly "
+        "for both changes and questions.\n\n"
+        f"VALID REPS: {valid_opts}\n\nUPCOMING EVENTS (index | date | city | event | reps):\n"
+        + "\n".join(lines) + f"\n\n{convo}LATEST MESSAGE:\n{text}"
     )
     return ask_json(prompt)
 
 
-def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
+def handle_mention(client, channel, thread_ts, msg_ts, user, text):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
         return
@@ -771,12 +774,27 @@ def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
     events = upcoming_events_for_change()
     valid = valid_rep_options()
     requester = {n for n, sid in rep_map().items() if sid == user}
-    parsed = parse_assignment_change(text, requester, events, valid, context)
+    parsed = parse_mention(text, requester, events, valid, context)
+    intent = parsed.get("intent")
+
+    # Answering a question about events / assignments.
+    if intent == "question":
+        answer = (parsed.get("answer") or "").strip()
+        if answer:
+            _bot_threads.add((channel, thread_ts))
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+            log.info("answered assignment question from %s", user)
+        else:
+            log.info("question with no answer; staying silent")
+        return
+
+    # Anything that isn't a concrete change for a specific event -> stay silent.
+    if intent != "change":
+        log.info("mention/DM not actionable; no response")
+        return
     idx = parsed.get("event_index")
-    reply = (parsed.get("reply") or "").strip()
     if not isinstance(idx, int) or not 0 <= idx < len(events):
-        # Not an actionable rep-assignment change for a specific event — stay silent.
-        log.info("mention/DM not an actionable change; no response")
+        log.info("change request without a specific event; staying silent")
         return
 
     _bot_threads.add((channel, thread_ts))         # engaged — follow the rest of this thread
@@ -797,7 +815,7 @@ def handle_assignment_change(client, channel, thread_ts, msg_ts, user, text):
         note = f" (couldn't find in the rep list: {', '.join(invalid)})" if invalid else ""
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text=(reply or f"No changes made to *{ev['event']}* ({fmt_day(ev['date'])}).") + note)
+            text=f"No changes made to *{ev['event']}* ({fmt_day(ev['date'])})." + note)
         return
 
     notion.pages.update(page_id=ev["id"],
@@ -927,7 +945,7 @@ def on_reaction(event, client):
 def on_app_mention(event, client):
     """A rep @-mentioned the bot with a rep-assignment change."""
     root = event.get("thread_ts") or event["ts"]
-    _bg(handle_assignment_change, client, event["channel"], root, event["ts"],
+    _bg(handle_mention, client, event["channel"], root, event["ts"],
         event.get("user"), event.get("text", ""))
 
 
@@ -942,7 +960,7 @@ def on_message(event, client):
     # A DM to the bot is a rep-assignment change request (incl. thread replies).
     if event.get("channel_type") == "im":
         if len(text) >= 3:
-            _bg(handle_assignment_change, client, channel, thread_ts or ts, ts, user, text)
+            _bg(handle_mention, client, channel, thread_ts or ts, ts, user, text)
         return
 
     # Channel @mentions are handled by on_app_mention (avoid double-processing).
@@ -951,7 +969,7 @@ def on_message(event, client):
     # A reply in a thread the bot is already conversing in — continue it.
     if thread_ts:
         if (channel, thread_ts) in _bot_threads:
-            _bg(handle_assignment_change, client, channel, thread_ts, ts, user, text)
+            _bg(handle_mention, client, channel, thread_ts, ts, user, text)
         return
     # Top-level community-channel message — proposal budget heads-up.
     if channel != CHANNEL:
