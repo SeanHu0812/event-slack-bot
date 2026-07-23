@@ -38,6 +38,18 @@ and posts a spending report
 (Estimated & Actual vs Monthly Budget per month, plus a multi-month total) as an
 ephemeral message visible only to you.
 
+### Weekly rep-assignment rundown
+Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) **NYC**
+events from Notion and:
+- If every event has reps → posts a rundown (events grouped by day, each as
+  `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`.
+- If any event is missing reps → DMs Drew Parten a reminder listing them (with Notion
+  links) and adds a `:done:` reaction. When Drew reacts `:done:`, it posts the rundown.
+
+`HOLD`/`[HOLD]` events are skipped. Rep names are mapped to Slack `@`-mentions via the
+`REP_MAP_CSV` tab (name → Slack ID); unmapped names post as plain text. `/events-this-week`
+shows the current rundown to whoever runs it (ephemeral).
+
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
 - **Non-proposal** (a link, a photo, no event name) → parse returns no event, bot stays silent.
@@ -62,13 +74,14 @@ ephemeral message visible only to you.
 
 - Socket Mode enabled → `xapp-` app-level token with `connections:write`.
 - Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
-  **`reactions:write`** (to seed the ✅ on over-budget confirmations),
-  **`commands`** (for the `/check-budget` slash command).
-- Event subscriptions (bot events): `reaction_added`, **`message.channels`**
-  (to see proposals when they're posted).
-- Slash command **`/check-budget`** created (Features → Slash Commands). In Socket Mode
-  no Request URL is needed.
-- Bot invited to #community-team (`/invite @your-bot`).
+  **`reactions:write`** (seed ✅/:done: reactions), **`commands`** (slash commands),
+  **`im:write`** + **`im:history`** (DM Drew and read his `:done:` reply).
+- Event subscriptions (bot events): `reaction_added`, **`message.channels`**.
+- Slash commands created (Features → Slash Commands): **`/check-budget`**,
+  **`/events-this-week`**. In Socket Mode no Request URL is needed.
+- Bot invited to #community-team, **#ny-vc-squad**, and **#qualifiers-across-department**
+  (`/invite @your-bot`).
+- Custom emoji **`:done:`** must exist in the workspace.
 - **Reinstall the app** after changing scopes, events, or commands.
 
 ## Budget sheet config

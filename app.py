@@ -1,6 +1,7 @@
-import os, json, base64, csv, io, logging, threading
+import os, json, base64, csv, io, re, time, logging, threading
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -38,6 +39,16 @@ CONFIRM_SENTINEL = "confirm and I'll create the Notion page"
 VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segundo",
     "Miami", "Montana", "NYC", "Nashville", "New Mexico", "Phoenix", "SF", "San Diego",
     "Seattle", "Vegas", "DC"}
+
+# Weekly rep-assignment rundown (Mondays 10:00 ET).
+RUNDOWN_TZ = ZoneInfo("America/New_York")
+RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
+RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
+# Channel IDs to post the rundown to (comma-separated env var; bot must be invited).
+RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get("RUNDOWN_CHANNELS", "").split(",") if c.strip()]
+DREW_ID = "U037HBMJBHU"                  # reps-assignment owner, DMed when reps are missing
+DONE_EMOJI = "done"                      # Drew reacts this to release the rundown
+REPS_REMINDER_SENTINEL = "Reps assignment are missing"
 
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -411,6 +422,173 @@ def check_budget_modal(channel_id):
 
 
 # ---------------------------------------------------------------------------
+# Weekly rep-assignment rundown
+# ---------------------------------------------------------------------------
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def first_url(text):
+    """Extract the first URL from a messy field (invite links sometimes have
+    trailing notes/emails appended)."""
+    if not text:
+        return None
+    m = _URL_RE.search(text)
+    return m.group(0).rstrip(".,);") if m else None
+
+
+def rep_map():
+    """name(lowercased) -> Slack user ID, from the published REP_MAP_CSV tab.
+    The Slack-ID cell is detected by shape, so column order/headers don't matter."""
+    url = os.environ.get("REP_MAP_CSV")
+    if not url:
+        return {}
+    try:
+        grid = _fetch_csv_grid(url)
+    except Exception:
+        log.exception("could not read REP_MAP_CSV")
+        return {}
+    m = {}
+    for row in grid:
+        sid = next((c.strip() for c in row if re.fullmatch(r"[UW][A-Z0-9]{6,}", c.strip())), None)
+        if not sid:
+            continue
+        name = next((c.strip() for c in row if c.strip() and c.strip() != sid), None)
+        if name:
+            m[name.lower()] = sid
+    return m
+
+
+def rep_mention(name, mapping):
+    """Slack <@ID> mention if the rep is mapped, else the plain name."""
+    sid = mapping.get(name.strip().lower())
+    return f"<@{sid}>" if sid else name
+
+
+def week_range():
+    """(monday, sunday) ISO dates for the current week in RUNDOWN_TZ."""
+    today = datetime.now(RUNDOWN_TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+
+def _plain(rich):
+    return "".join(t.get("plain_text", "") for t in (rich or []))
+
+
+def fetch_week_events():
+    """This week's NYC events (HOLD placeholders excluded), sorted by date."""
+    start, end = week_range()
+    r = notion.data_sources.query(
+        data_source_id=data_source_id(),
+        filter={"and": [
+            {"property": "City", "select": {"equals": RUNDOWN_CITY}},
+            {"property": "Date", "date": {"on_or_after": start}},
+            {"property": "Date", "date": {"on_or_before": end}},
+        ]},
+        sorts=[{"property": "Date", "direction": "ascending"}])
+    events = []
+    for page in r["results"]:
+        props = page["properties"]
+        name = _plain(props["Event"]["title"]).strip()
+        if name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
+            continue
+        d = (props.get("Date") or {}).get("date") or {}
+        if not d.get("start"):
+            continue
+        events.append({
+            "event": name,
+            "date": d["start"][:10],
+            "invite": first_url(_plain(props.get("Invite Link", {}).get("rich_text"))),
+            "reps": [o["name"] for o in props.get("Reps", {}).get("multi_select", [])],
+            "url": page["url"],
+        })
+    events.sort(key=lambda e: e["date"])
+    return events
+
+
+def fmt_day(iso):
+    dt = datetime.strptime(iso, "%Y-%m-%d")
+    return f"{dt.strftime('%A, %B')} {dt.day}"
+
+
+def build_rundown(events):
+    """The weekly rundown message text (Slack mrkdwn)."""
+    mapping = rep_map()
+    by_day = {}
+    for e in events:
+        by_day.setdefault(e["date"], []).append(e)
+    out = [RUNDOWN_HEADER, ""]
+    for d in sorted(by_day):
+        out.append(f"{fmt_day(d)}:")
+        out.append("")
+        for e in by_day[d]:
+            link = f"<{e['invite']}|{e['event']}>" if e["invite"] else e["event"]
+            reps = " ".join(rep_mention(r, mapping) for r in e["reps"])
+            out.append(f"• {link}" + (f" - {reps}" if reps else ""))
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def post_rundown(client, events):
+    text = build_rundown(events)
+    for ch in RUNDOWN_CHANNELS:
+        client.chat_postMessage(channel=ch, text=text)
+    log.info("posted weekly rundown to %s (%d events)", RUNDOWN_CHANNELS, len(events))
+
+
+def send_reps_reminder(client, missing):
+    lines = [f"<@{DREW_ID}> Hi happy Monday! {REPS_REMINDER_SENTINEL} for the following events:"]
+    for e in missing:
+        lines.append(f"{fmt_day(e['date'])} — {e['event']} {e['url']}")
+    lines.append("Please complete the assignment and react :done: below. Thanks!")
+    dm = client.conversations_open(users=DREW_ID)["channel"]["id"]
+    resp = client.chat_postMessage(channel=dm, text="\n".join(lines))
+    try:
+        client.reactions_add(channel=dm, timestamp=resp["ts"], name=DONE_EMOJI)
+    except Exception:
+        log.warning("could not add :%s: reaction (needs reactions:write / valid emoji)", DONE_EMOJI)
+    log.info("DMed Drew a reps reminder for %d event(s)", len(missing))
+
+
+def run_weekly_rundown(client):
+    """Monday 10am job: post the rundown, or nudge Drew if reps are missing."""
+    events = fetch_week_events()
+    if not events:
+        log.info("no %s events this week; skipping rundown", RUNDOWN_CITY)
+        return
+    missing = [e for e in events if not e["reps"]]
+    if missing:
+        send_reps_reminder(client, missing)
+    else:
+        post_rundown(client, events)
+
+
+def handle_reps_done(client, channel, ts):
+    """Drew reacted :done: on the reminder DM — post the rundown now."""
+    msg = client.conversations_history(
+        channel=channel, latest=ts, inclusive=True, limit=1)["messages"][0]
+    if REPS_REMINDER_SENTINEL not in (msg.get("text") or ""):
+        return                                    # not our reminder message
+    events = fetch_week_events()
+    if events:
+        post_rundown(client, events)
+    log.info("Drew confirmed reps; posted rundown")
+
+
+def weekly_scheduler(client):
+    """Fire run_weekly_rundown once each Monday during the 10:00 ET hour."""
+    last = None
+    while True:
+        now = datetime.now(RUNDOWN_TZ)
+        if now.weekday() == 0 and now.hour == 10 and now.date() != last:
+            last = now.date()
+            log.info("weekly rundown trigger firing")
+            _bg(run_weekly_rundown, client)
+        time.sleep(30)
+
+
+# ---------------------------------------------------------------------------
 # Slack handlers
 # ---------------------------------------------------------------------------
 
@@ -499,13 +677,18 @@ def handle_confirmation(client, confirm_ts):
 def on_reaction(event, client):
     item = event.get("item", {})
     reaction, user = event.get("reaction"), event.get("user")
+    channel, ts = item.get("channel"), item.get("ts")
     log.info("reaction_added: reaction=%r user=%r channel=%r type=%r",
-             reaction, user, item.get("channel"), item.get("type"))
-    if item.get("channel") != CHANNEL or item.get("type") != "message":
+             reaction, user, channel, item.get("type"))
+    if item.get("type") != "message":
         return
-    if user not in APPROVERS:
+    # Drew releasing the weekly rundown from the reminder DM.
+    if reaction == DONE_EMOJI and user == DREW_ID:
+        _bg(handle_reps_done, client, channel, ts)
         return
-    ts = item["ts"]
+    # Event approvals / over-budget confirmations in #community-team.
+    if channel != CHANNEL or user not in APPROVERS:
+        return
     if reaction == APPROVE_EMOJI:
         _bg(handle_approval, client, ts)          # slow work off the dispatch path
     elif reaction == CONFIRM_EMOJI:
@@ -569,6 +752,22 @@ def _send_budget_report(client, channel, user, locations, months):
     client.chat_postMessage(channel=user, text=text)
 
 
+@app.command("/events-this-week")
+def cmd_events_week(ack, body, client):
+    ack()
+    _bg(_send_week_preview, client, body.get("channel_id"), body.get("user_id"))
+
+
+def _send_week_preview(client, channel, user):
+    events = fetch_week_events()
+    text = build_rundown(events) if events else "No NYC events this week."
+    try:
+        client.chat_postEphemeral(channel=channel, user=user, text=text)
+    except Exception:
+        client.chat_postMessage(channel=user, text=text)
+    log.info("posted /events-this-week preview for %s", user)
+
+
 class _Health(BaseHTTPRequestHandler):
     """Trivial 200-OK responder."""
     def do_GET(self):
@@ -591,4 +790,5 @@ def start_health_server():
 if __name__ == "__main__":
     log.info("events-bot starting (socket mode)")
     threading.Thread(target=start_health_server, daemon=True).start()
+    threading.Thread(target=weekly_scheduler, args=(app.client,), daemon=True).start()
     SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()

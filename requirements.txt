@@ -4,3 +4,4 @@ anthropic>=0.40
 python-dotenv>=1.0
 gspread>=6.0
 google-auth>=2.0
+tzdata>=2024.1
