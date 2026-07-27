@@ -16,6 +16,13 @@ try:
 except ImportError:
     _SHEETS_AVAILABLE = False
 
+try:
+    from googleapiclient.discovery import build as gcal_build
+    from google.oauth2.credentials import Credentials as OAuthCredentials
+    _CALENDAR_AVAILABLE = True
+except ImportError:
+    _CALENDAR_AVAILABLE = False
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("events-bot")
@@ -46,6 +53,11 @@ RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
 RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
 _rundown_msgs = set()                    # (channel, ts) of the latest rundown posts
+
+# Google Calendar: clone rundown events from Sean's personal calendar to the shared one.
+CAL_SOURCE = "sean.hu@rho.co"            # personal calendar events are cloned FROM
+CAL_TARGET = ("c_a6779362659cf757210d14e15b7010a789e7c861a40c61957bb120527c5d550a"
+              "@group.calendar.google.com")   # New York Event Calendar
 # Channel IDs to post the rundown to (bot must be invited to each).
 # Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
 RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
@@ -509,6 +521,7 @@ def fetch_week_events():
         if not d.get("start"):
             continue
         events.append({
+            "id": page["id"],
             "event": name,
             "date": d["start"][:10],
             "invite": first_url(_plain(props.get("Invite Link", {}).get("rich_text"))),
@@ -591,6 +604,10 @@ def post_rundown(client, events):
         except Exception:
             log.exception("failed to post rundown to %s", ch)
     log.info("posted weekly rundown to %s (%d events)", RUNDOWN_CHANNELS, len(events))
+    try:
+        clone_week_events()                        # mirror this week's events to gcal
+    except Exception:
+        log.exception("weekly calendar clone failed")
 
 
 def thread_parent_is_rundown(client, channel, thread_ts):
@@ -649,6 +666,162 @@ def send_reps_reminder(client, missing):
     except Exception:
         log.warning("could not add :%s: reaction (needs reactions:write / valid emoji)", DONE_EMOJI)
     log.info("DMed Drew a reps reminder for %d event(s)", len(missing))
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar sync (clone rundown events + keep guests in step with Notion)
+# ---------------------------------------------------------------------------
+
+_calendar = None
+
+
+def calendar():
+    """Google Calendar client acting as Sean via OAuth (a service account can't
+    invite guests). None if the libs or OAuth env vars aren't configured."""
+    global _calendar
+    if _calendar is not None:
+        return _calendar
+    if not _CALENDAR_AVAILABLE:
+        return None
+    cid = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    csec = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    rtok = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+    if not (cid and csec and rtok):
+        return None
+    creds = OAuthCredentials(
+        None, refresh_token=rtok, client_id=cid, client_secret=csec,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/calendar"])
+    _calendar = gcal_build("calendar", "v3", credentials=creds, cache_discovery=False)
+    log.info("google calendar client ready (acting as %s)", CAL_SOURCE)
+    return _calendar
+
+
+def rep_emails():
+    """name(lowercased) -> email, from the REP_MAP_CSV tab's email column."""
+    url = os.environ.get("REP_MAP_CSV")
+    if not url:
+        return {}
+    try:
+        grid = _fetch_csv_grid(url)
+    except Exception:
+        return {}
+    m = {}
+    for row in grid:
+        email = next((c.strip() for c in row if "@" in c and "." in c.split("@")[-1]), None)
+        if not email:
+            continue
+        name = next((c.strip() for c in row if c.strip() and c.strip() != email
+                     and not re.fullmatch(r"[UW][A-Z0-9]{6,}", c.strip())), None)
+        if name:
+            m[name.lower()] = email
+    return m
+
+
+def _rep_attendees(rep_names, emails):
+    return [{"email": emails[r.strip().lower()]} for r in rep_names
+            if r.strip().lower() in emails]
+
+
+def find_clone(page_id):
+    """The New-York-calendar event cloned from a given Notion page, or None.
+    Located by the notionPageId we stamp into the event's private metadata."""
+    cal = calendar()
+    if cal is None:
+        return None
+    try:
+        items = cal.events().list(
+            calendarId=CAL_TARGET, privateExtendedProperty=f"notionPageId={page_id}",
+            showDeleted=False, maxResults=1).execute().get("items", [])
+    except Exception:
+        log.exception("calendar lookup failed for %s", page_id)
+        return None
+    return items[0] if items else None
+
+
+def _match_calendar_sources(events, cal_events):
+    """Map each rundown event to the same-day personal-calendar event it clones
+    from (titles differ, so let the model align them). Returns {rundown_idx: cal_idx}."""
+    if not events or not cal_events:
+        return {}
+    r_lines = [f"R{i}: {e['date']} | {e['event']}" for i, e in enumerate(events)]
+    c_lines = [f"C{j}: {e['start'][:10]} | {e['summary']}" for j, e in enumerate(cal_events)]
+    out = ask_json(
+        "Match each rundown event (R#) to the calendar event (C#) that is the SAME event "
+        "(same date; titles may be worded differently). Return ONLY JSON "
+        '{"matches": {"R0": <C index or null>, ...}}. Only match same-day events.\n\n'
+        "RUNDOWN:\n" + "\n".join(r_lines) + "\n\nCALENDAR:\n" + "\n".join(c_lines),
+        max_tokens=500)
+    result = {}
+    for k, v in (out.get("matches") or {}).items():
+        try:
+            result[int(k[1:])] = int(v) if v is not None else None
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def clone_week_events():
+    """Clone this week's rundown events from the personal calendar to the shared
+    New York calendar, adding assigned reps as guests. Idempotent + best-effort."""
+    cal = calendar()
+    if cal is None:
+        log.info("calendar not configured; skipping clone")
+        return
+    events = fetch_week_events()
+    if not events:
+        return
+    monday, sunday = week_range()
+    tmin = datetime.fromisoformat(monday).replace(tzinfo=RUNDOWN_TZ).isoformat()
+    tmax = (datetime.fromisoformat(sunday) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
+    try:
+        src_events = cal.events().list(
+            calendarId=CAL_SOURCE, timeMin=tmin, timeMax=tmax,
+            singleEvents=True, orderBy="startTime", maxResults=250).execute().get("items", [])
+    except Exception:
+        log.exception("could not read personal calendar; skipping clone")
+        return
+    src_events = [e for e in src_events if e.get("start", {}).get("dateTime")]
+    matches = _match_calendar_sources(events, src_events)
+    emails = rep_emails()
+    for i, e in enumerate(events):
+        ci = matches.get(i)
+        if ci is None or not 0 <= ci < len(src_events):
+            log.info("no calendar source for %r; skipping clone", e["event"])
+            continue
+        if find_clone(e["id"]):
+            log.info("already cloned %r; skipping", e["event"])
+            continue
+        src = src_events[ci]
+        body = {
+            "summary": src.get("summary"),
+            "start": src.get("start"),
+            "end": src.get("end"),
+            "location": src.get("location"),
+            "description": src.get("description"),
+            "attendees": _rep_attendees(e["reps"], emails),
+            "extendedProperties": {"private": {"notionPageId": e["id"]}},
+        }
+        try:
+            cal.events().insert(calendarId=CAL_TARGET, body=body, sendUpdates="all").execute()
+            log.info("cloned %r with %d guest(s)", e["event"], len(body["attendees"]))
+        except Exception:
+            log.exception("failed to clone %r", e["event"])
+
+
+def update_calendar_guests(page_id, rep_names):
+    """Sync a cloned event's guest list to Notion's reps — silently (no emails)."""
+    ev = find_clone(page_id)
+    if not ev:
+        return                                     # event was never cloned; nothing to do
+    attendees = _rep_attendees(rep_names, rep_emails())
+    try:
+        calendar().events().patch(
+            calendarId=CAL_TARGET, eventId=ev["id"],
+            body={"attendees": attendees}, sendUpdates="none").execute()
+        log.info("updated calendar guests for %s (%d)", page_id, len(attendees))
+    except Exception:
+        log.exception("failed to update calendar guests for %s", page_id)
 
 
 def run_weekly_rundown(client):
@@ -919,6 +1092,10 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     notion.pages.update(page_id=ev["id"],
                         properties={"Reps": {"multi_select": [{"name": n} for n in new]}})
     log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
+    try:
+        update_calendar_guests(ev["id"], new)      # keep the gcal invite in sync (no email)
+    except Exception:
+        log.exception("calendar guest sync failed for %s", ev["id"])
 
     # A rundown reply edits the rundown message in place; otherwise reply with a summary.
     if is_rundown:

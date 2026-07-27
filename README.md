@@ -61,6 +61,16 @@ covers") and the bot updates Notion and **edits the rundown message in place in 
 channels** — it does not post a new message. Works even after a restart (it re-finds the
 rundown message by content).
 
+### Google Calendar sync
+When the Monday rundown posts, the bot **clones each listed event** from Sean's personal
+calendar (`sean.hu@rho.co`) to the shared **New York Event Calendar**, matching by date +
+title, and **adds the assigned reps as guests** (emails from the rep sheet's email column).
+The initial clone sends an invite; the event is stamped with its Notion page id so it can
+be found later. When reps change in Notion (any @mention/DM/reply), the bot **updates the
+cloned event's guest list with no email** (`sendUpdates=none`) — so reps aren't spammed.
+Cloning is idempotent (won't duplicate on restart) and best-effort (a calendar failure
+never blocks the Slack/Notion flows). Requires the OAuth env vars below; skipped without them.
+
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
 the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet it says so.
@@ -138,6 +148,16 @@ Month` table (Month / Estimated columns) — cells are located by content, not p
   (full JSON on one line, or base64) in `GOOGLE_SERVICE_ACCOUNT_JSON`.
 - **Share the spreadsheet** with the service account's `client_email` (Viewer).
 - Tab titles must be exactly `NYC` and `SF`.
+
+## Google Calendar config (OAuth as Sean)
+
+Calendar sync needs the bot to act as a real user (service accounts can't invite guests).
+1. Enable the **Google Calendar API**; use an OAuth **Client ID/Secret** (the one IT issued).
+2. Run `get_google_token.py` **locally** once (signs in as `sean.hu@rho.co`, approves
+   calendar access) → prints a **refresh token**.
+3. Set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`.
+4. Add an **email column** to the rep-map tab (rep name → Slack ID → email) for guests.
+5. Sean must have edit access to the New York Event Calendar (he's the one being acted as).
 
 ## Notion config (already done)
 
