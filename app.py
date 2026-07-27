@@ -924,13 +924,13 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     if is_rundown:
         edit_rundowns(client)
         return
-    mapping = rep_map()
+    # Plain names only — never @-mention in a confirmation, so nobody gets re-pinged.
     parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
     if removed:
-        parts.append("Removed: " + ", ".join(rep_mention(r, mapping) for r in removed))
+        parts.append("Removed: " + ", ".join(removed))
     if add:
-        parts.append("Added: " + ", ".join(rep_mention(a, mapping) for a in add))
-    parts.append("Reps now: " + (", ".join(rep_mention(n, mapping) for n in new) or "none"))
+        parts.append("Added: " + ", ".join(add))
+    parts.append("Reps now: " + (", ".join(new) or "none"))
     if invalid:
         parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
