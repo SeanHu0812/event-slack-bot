@@ -56,10 +56,11 @@ pinged — which is why changes edit in place rather than reposting.
 `REP_MAP_CSV` tab (name → Slack ID); unmapped names post as plain text. `/events-this-week`
 shows the current rundown to whoever runs it (ephemeral).
 
-**Reply to a posted rundown** with a change ("take Dylan off the Goldilocks event, Marc
-covers") and the bot updates Notion and **edits the rundown message in place in both
-channels** — it does not post a new message. Works even after a restart (it re-finds the
-rundown message by content).
+**Any** rep-assignment change — a reply in the rundown thread, an @mention, or a DM —
+updates Notion and then **edits the weekly rundown message in place in both channels** so
+the single message always shows the current assignments. It never posts a new rundown; a
+reply in the rundown thread posts nothing else, while an @mention/DM also gets a plain-text
+confirmation. Works even after a restart (it re-finds the rundown message by content).
 
 ### Google Calendar sync
 When the Monday rundown posts, the bot **clones each listed event** from Sean's personal

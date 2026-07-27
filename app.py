@@ -1123,11 +1123,17 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     except Exception:
         log.exception("calendar guest sync failed for %s", ev["id"])
 
-    # A rundown reply edits the rundown message in place; otherwise reply with a summary.
-    if is_rundown:
+    # Always keep the weekly rundown message current — edit in place, no new message —
+    # regardless of how the change came in (reply, @mention, or DM).
+    try:
         edit_rundowns(client)
+    except Exception:
+        log.exception("rundown refresh failed")
+
+    # A reply in the rundown thread needs no extra message; the edit is the feedback.
+    if is_rundown:
         return
-    # Plain names only — never @-mention in a confirmation, so nobody gets re-pinged.
+    # Otherwise (@mention / DM): a plain-text confirmation — no @-mentions, no pings.
     parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
     if removed:
         parts.append("Removed: " + ", ".join(removed))
