@@ -739,6 +739,28 @@ def find_clone(page_id):
     return items[0] if items else None
 
 
+def _norm(s):
+    return " ".join((s or "").split()).strip().lower()
+
+
+def target_has_event(summary, date):
+    """Is an event with this title already on the New York calendar that day?
+    Guards against duplicating events that got there by any means (not just ours)."""
+    cal = calendar()
+    if cal is None or not date:
+        return False
+    try:
+        tmin = datetime.fromisoformat(date).replace(tzinfo=RUNDOWN_TZ).isoformat()
+        tmax = (datetime.fromisoformat(date) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
+        items = cal.events().list(
+            calendarId=CAL_TARGET, timeMin=tmin, timeMax=tmax,
+            singleEvents=True, maxResults=250).execute().get("items", [])
+    except Exception:
+        log.exception("target-calendar dupe check failed for %r", summary)
+        return False
+    return any(_norm(it.get("summary")) == _norm(summary) for it in items)
+
+
 def _match_calendar_sources(events, cal_events):
     """Map each rundown event to the same-day personal-calendar event it clones
     from (titles differ, so let the model align them). Returns {rundown_idx: cal_idx}."""
@@ -789,10 +811,14 @@ def clone_week_events():
         if ci is None or not 0 <= ci < len(src_events):
             log.info("no calendar source for %r; skipping clone", e["event"])
             continue
+        src = src_events[ci]
         if find_clone(e["id"]):
             log.info("already cloned %r; skipping", e["event"])
             continue
-        src = src_events[ci]
+        src_date = (src.get("start", {}).get("dateTime") or "")[:10]
+        if target_has_event(src.get("summary"), src_date):
+            log.info("%r already on the New York calendar; skipping to avoid a dupe", e["event"])
+            continue
         body = {
             "summary": src.get("summary"),
             "start": src.get("start"),

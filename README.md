@@ -68,8 +68,11 @@ title, and **adds the assigned reps as guests** (emails from the rep sheet's ema
 The initial clone sends an invite; the event is stamped with its Notion page id so it can
 be found later. When reps change in Notion (any @mention/DM/reply), the bot **updates the
 cloned event's guest list with no email** (`sendUpdates=none`) — so reps aren't spammed.
-Cloning is idempotent (won't duplicate on restart) and best-effort (a calendar failure
-never blocks the Slack/Notion flows). Requires the OAuth env vars below; skipped without them.
+Before creating anything it **checks the New York calendar** and skips an event that's
+already there — by our Notion-page stamp *or* by a same-day title match — so it never
+duplicates (whether the event was cloned earlier or added by other means). Best-effort
+throughout (a calendar failure never blocks the Slack/Notion flows). Requires the OAuth
+env vars below; skipped without them.
 
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
