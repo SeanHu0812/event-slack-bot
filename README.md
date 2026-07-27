@@ -46,6 +46,12 @@ events from Notion and:
 - If any event is missing reps → DMs Drew Parten a reminder listing them (with Notion
   links) and adds a `:done:` reaction. When Drew reacts `:done:`, it posts the rundown.
 
+Before posting, the bot scans the channels for a rundown already sent this week and skips
+if found — so a restart/republish (which resets the in-memory schedule flag) can't cause a
+duplicate post. The Drew reminder is likewise not re-sent if one already went out this week.
+Editing the rundown does **not** re-notify already-tagged reps — only a newly added rep is
+pinged — which is why changes edit in place rather than reposting.
+
 `HOLD`/`[HOLD]` events are skipped. Rep names are mapped to Slack `@`-mentions via the
 `REP_MAP_CSV` tab (name → Slack ID); unmapped names post as plain text. `/events-this-week`
 shows the current rundown to whoever runs it (ephemeral).

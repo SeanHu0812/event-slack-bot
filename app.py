@@ -542,7 +542,46 @@ def build_rundown(events):
     return "\n".join(out).strip()
 
 
+def week_start_epoch():
+    """Unix timestamp for 00:00 ET on this week's Monday."""
+    today = datetime.now(RUNDOWN_TZ).date()
+    monday = today - timedelta(days=today.weekday())
+    return datetime(monday.year, monday.month, monday.day, tzinfo=RUNDOWN_TZ).timestamp()
+
+
+def rundown_posted_this_week(client):
+    """Scan the rundown channels for a rundown message already posted this week
+    (so a restart/republish doesn't cause a duplicate post)."""
+    start = week_start_epoch()
+    for ch in RUNDOWN_CHANNELS:
+        try:
+            msgs = client.conversations_history(channel=ch, limit=100)["messages"]
+        except Exception:
+            continue
+        for m in msgs:
+            if (m.get("bot_id") or m.get("user") == BOT_USER_ID) \
+                    and RUNDOWN_SENTINEL in (m.get("text") or "") \
+                    and float(m.get("ts", 0)) >= start:
+                return True
+    return False
+
+
+def reminder_sent_this_week(client):
+    """Has Drew already been DMed a reps reminder this week?"""
+    try:
+        dm = client.conversations_open(users=DREW_ID)["channel"]["id"]
+        msgs = client.conversations_history(channel=dm, limit=50)["messages"]
+    except Exception:
+        return False
+    start = week_start_epoch()
+    return any(REPS_REMINDER_SENTINEL in (m.get("text") or "") and float(m.get("ts", 0)) >= start
+               for m in msgs)
+
+
 def post_rundown(client, events):
+    if rundown_posted_this_week(client):
+        log.info("rundown already posted this week; not re-posting")
+        return
     text = build_rundown(events)
     _rundown_msgs.clear()                          # track this week's rundown messages
     for ch in RUNDOWN_CHANNELS:
@@ -620,6 +659,9 @@ def run_weekly_rundown(client):
         return
     missing = [e for e in events if not e["reps"]]
     if missing:
+        if reminder_sent_this_week(client):
+            log.info("reps reminder already sent this week; skipping")
+            return
         send_reps_reminder(client, missing)
     else:
         post_rundown(client, events)
