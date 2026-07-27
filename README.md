@@ -50,6 +50,11 @@ events from Notion and:
 `REP_MAP_CSV` tab (name → Slack ID); unmapped names post as plain text. `/events-this-week`
 shows the current rundown to whoever runs it (ephemeral).
 
+**Reply to a posted rundown** with a change ("take Dylan off the Goldilocks event, Marc
+covers") and the bot updates Notion and **edits the rundown message in place in both
+channels** — it does not post a new message. Works even after a restart (it re-finds the
+rundown message by content).
+
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
 the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet it says so.

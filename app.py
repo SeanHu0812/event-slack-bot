@@ -44,6 +44,8 @@ VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segu
 RUNDOWN_TZ = ZoneInfo("America/New_York")
 RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
+RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
+_rundown_msgs = set()                    # (channel, ts) of the latest rundown posts
 # Channel IDs to post the rundown to (bot must be invited to each).
 # Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
 RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
@@ -542,9 +544,58 @@ def build_rundown(events):
 
 def post_rundown(client, events):
     text = build_rundown(events)
+    _rundown_msgs.clear()                          # track this week's rundown messages
     for ch in RUNDOWN_CHANNELS:
-        client.chat_postMessage(channel=ch, text=text)
+        try:
+            resp = client.chat_postMessage(channel=ch, text=text)
+            _rundown_msgs.add((ch, resp["ts"]))
+        except Exception:
+            log.exception("failed to post rundown to %s", ch)
     log.info("posted weekly rundown to %s (%d events)", RUNDOWN_CHANNELS, len(events))
+
+
+def thread_parent_is_rundown(client, channel, thread_ts):
+    """Stateless check (survives restart): is this thread rooted on a rundown message?"""
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)["messages"]
+    except Exception:
+        return False
+    p = msgs[0] if msgs else {}
+    return bool(p.get("bot_id") or p.get("user") == BOT_USER_ID) and \
+        RUNDOWN_SENTINEL in (p.get("text") or "")
+
+
+def find_rundown_ts(client, channel):
+    """The ts of the current rundown message in a channel: from memory if tracked,
+    else the latest bot rundown message in recent history (restart-safe)."""
+    for ch, ts in _rundown_msgs:
+        if ch == channel:
+            return ts
+    try:
+        msgs = client.conversations_history(channel=channel, limit=100)["messages"]
+    except Exception:
+        return None
+    for m in msgs:                                 # newest first
+        if (m.get("bot_id") or m.get("user") == BOT_USER_ID) and \
+                RUNDOWN_SENTINEL in (m.get("text") or ""):
+            return m["ts"]
+    return None
+
+
+def edit_rundowns(client):
+    """Regenerate the rundown from current Notion data and edit it in place in
+    EVERY rundown channel, so #ny-vc-squad and #qualifiers stay in sync."""
+    text = build_rundown(fetch_week_events())
+    for ch in RUNDOWN_CHANNELS:
+        ts = find_rundown_ts(client, ch)
+        if not ts:
+            log.warning("no rundown message found in %s to edit", ch)
+            continue
+        try:
+            client.chat_update(channel=ch, ts=ts, text=text)
+        except Exception:
+            log.exception("failed to update rundown in %s", ch)
+    log.info("edited rundown in %s", RUNDOWN_CHANNELS)
 
 
 def send_reps_reminder(client, missing):
@@ -767,10 +818,11 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
     return ask_json(prompt, max_tokens=2000)
 
 
-def handle_mention(client, channel, thread_ts, msg_ts, user, text):
+def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
         return
+    is_rundown = rundown or (channel, thread_ts) in _rundown_msgs
     context = thread_transcript(client, channel, thread_ts, msg_ts)
     events = upcoming_events_for_change()
     valid = valid_rep_options()
@@ -812,7 +864,10 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text):
         if a not in new:
             new.append(a)
 
+    removed = [r for r in current if r.strip().lower() in remove]
     if set(new) == set(current):
+        if is_rundown:                             # nothing to change; don't clutter the thread
+            return
         note = f" (couldn't find in the rep list: {', '.join(invalid)})" if invalid else ""
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
@@ -821,8 +876,13 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text):
 
     notion.pages.update(page_id=ev["id"],
                         properties={"Reps": {"multi_select": [{"name": n} for n in new]}})
+    log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
+
+    # A rundown reply edits the rundown message in place; otherwise reply with a summary.
+    if is_rundown:
+        edit_rundowns(client)
+        return
     mapping = rep_map()
-    removed = [r for r in current if r.strip().lower() in remove]
     parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
     if removed:
         parts.append("Removed: " + ", ".join(rep_mention(r, mapping) for r in removed))
@@ -832,7 +892,6 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text):
     if invalid:
         parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
-    log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
 
 
 # ---------------------------------------------------------------------------
@@ -942,6 +1001,17 @@ def on_reaction(event, client):
         _bg(handle_confirmation, client, ts)
 
 
+def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
+    """Route a channel thread reply: continue a bot conversation, or — if it's a
+    reply to the weekly rundown — apply the change and edit the rundown in place."""
+    if (channel, thread_ts) in _bot_threads:
+        handle_mention(client, channel, thread_ts, msg_ts, user, text)
+        return
+    if (channel, thread_ts) in _rundown_msgs or thread_parent_is_rundown(client, channel, thread_ts):
+        handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=True)
+    # a thread in a rundown channel that isn't ours -> ignore
+
+
 @app.event("app_mention")
 def on_app_mention(event, client):
     """A rep @-mentioned the bot with a rep-assignment change."""
@@ -967,10 +1037,11 @@ def on_message(event, client):
     # Channel @mentions are handled by on_app_mention (avoid double-processing).
     if BOT_USER_ID and f"<@{BOT_USER_ID}>" in text:
         return
-    # A reply in a thread the bot is already conversing in — continue it.
+    # A thread reply: continue a bot conversation, or a reply to the weekly rundown.
     if thread_ts:
-        if (channel, thread_ts) in _bot_threads:
-            _bg(handle_mention, client, channel, thread_ts, ts, user, text)
+        if ((channel, thread_ts) in _bot_threads or (channel, thread_ts) in _rundown_msgs
+                or channel in RUNDOWN_CHANNELS):
+            _bg(handle_thread_reply, client, channel, thread_ts, ts, user, text)
         return
     # Top-level community-channel message — proposal budget heads-up.
     if channel != CHANNEL:
