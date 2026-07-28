@@ -767,7 +767,8 @@ def _match_calendar_sources(events, cal_events):
     if not events or not cal_events:
         return {}
     r_lines = [f"R{i}: {e['date']} | {e['event']}" for i, e in enumerate(events)]
-    c_lines = [f"C{j}: {e['start'][:10]} | {e['summary']}" for j, e in enumerate(cal_events)]
+    c_lines = [f"C{j}: {(e.get('start', {}).get('dateTime') or '')[:10]} | {e.get('summary', '')}"
+               for j, e in enumerate(cal_events)]
     out = ask_json(
         "Match each rundown event (R#) to the calendar event (C#) that is the SAME event "
         "(same date; titles may be worded differently). Return ONLY JSON "
