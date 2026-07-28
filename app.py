@@ -610,17 +610,6 @@ def post_rundown(client, events):
         log.exception("weekly calendar sync failed")
 
 
-def thread_parent_is_rundown(client, channel, thread_ts):
-    """Stateless check (survives restart): is this thread rooted on a rundown message?"""
-    try:
-        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=1)["messages"]
-    except Exception:
-        return False
-    p = msgs[0] if msgs else {}
-    return bool(p.get("bot_id") or p.get("user") == BOT_USER_ID) and \
-        RUNDOWN_SENTINEL in (p.get("text") or "")
-
-
 def find_rundown_ts(client, channel):
     """The ts of the current rundown message in a channel: from memory if tracked,
     else the latest bot rundown message in recent history (restart-safe)."""
@@ -1125,6 +1114,37 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
     return ask_json(prompt, max_tokens=2000)
 
 
+def available_reps(date, exclude=()):
+    """Active reps (assigned to some event this week) not already booked on `date`,
+    excluding given names. Plain-text availability without touching calendars."""
+    excl = {r.strip().lower() for r in exclude}
+    active, busy = set(), set()
+    for e in fetch_week_events():
+        for r in e["reps"]:
+            active.add(r)
+            if e["date"] == date:
+                busy.add(r)
+    return sorted(r for r in active - busy if r.strip().lower() not in excl)
+
+
+def replacement_prompt(removed, date):
+    """Ask who is covering for a dropped rep and list who's free that day (no tags)."""
+    if len(removed) == 1:
+        n = removed[0]
+        poss = f"{n}'" if n.endswith("s") else f"{n}'s"
+        head = f"Who will be taking {poss} place?"
+    else:
+        head = "Who will be taking their place?"
+    avail = available_reps(date, exclude=removed)
+    lines = [head]
+    if avail:
+        lines.append("The reps available that day are:")
+        lines += [f"• {r}" for r in avail]
+    else:
+        lines.append("(No other active reps look free that day.)")
+    return "\n".join(lines)
+
+
 def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
@@ -1196,16 +1216,28 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     except Exception:
         log.exception("rundown refresh failed")
 
-    # A reply in the rundown thread needs no extra message; the edit is the feedback.
+    # A removal with no named replacement -> ask who's covering, listing free reps.
+    needs_replacement = bool(removed) and not add
+
+    # A reply in the rundown thread needs no extra message; the edit is the feedback —
+    # unless we still need to ask for a replacement, which is a required follow-up.
     if is_rundown:
+        if needs_replacement:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                    text=replacement_prompt(removed, ev["date"]))
         return
+
     # Otherwise (@mention / DM): a plain-text confirmation — no @-mentions, no pings.
     parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
     if removed:
         parts.append("Removed: " + ", ".join(removed))
     if add:
         parts.append("Added: " + ", ".join(add))
-    parts.append("Reps now: " + (", ".join(new) or "none"))
+    if needs_replacement:
+        parts.append("")
+        parts.append(replacement_prompt(removed, ev["date"]))
+    else:
+        parts.append("Reps now: " + (", ".join(new) or "none"))
     if invalid:
         parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
@@ -1319,14 +1351,28 @@ def on_reaction(event, client):
 
 
 def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
-    """Route a channel thread reply: continue a bot conversation, or — if it's a
-    reply to the weekly rundown — apply the change and edit the rundown in place."""
+    """Handle a reply in any thread the bot is part of — a rundown, a prior
+    conversation, or any thread where Event-Bot has posted — even without an
+    @mention. Recognizes the thread from memory, or by reading it (restart-safe)."""
     if (channel, thread_ts) in _bot_threads:
         handle_mention(client, channel, thread_ts, msg_ts, user, text)
         return
-    if (channel, thread_ts) in _rundown_msgs or thread_parent_is_rundown(client, channel, thread_ts):
+    if (channel, thread_ts) in _rundown_msgs:
         handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=True)
-    # a thread in a rundown channel that isn't ours -> ignore
+        return
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)["messages"]
+    except Exception:
+        return
+    parent = msgs[0] if msgs else {}
+    is_rundown = bool(parent.get("bot_id") or parent.get("user") == BOT_USER_ID) and \
+        RUNDOWN_SENTINEL in (parent.get("text") or "")
+    bot_here = any(m.get("bot_id") or m.get("user") == BOT_USER_ID for m in msgs)
+    if is_rundown:
+        handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=True)
+    elif bot_here:
+        handle_mention(client, channel, thread_ts, msg_ts, user, text)
+    # else: not a thread the bot is in -> ignore
 
 
 @app.event("app_mention")
@@ -1354,11 +1400,9 @@ def on_message(event, client):
     # Channel @mentions are handled by on_app_mention (avoid double-processing).
     if BOT_USER_ID and f"<@{BOT_USER_ID}>" in text:
         return
-    # A thread reply: continue a bot conversation, or a reply to the weekly rundown.
+    # Any thread reply -> handle it if the bot is part of that thread (decided in _bg).
     if thread_ts:
-        if ((channel, thread_ts) in _bot_threads or (channel, thread_ts) in _rundown_msgs
-                or channel in RUNDOWN_CHANNELS):
-            _bg(handle_thread_reply, client, channel, thread_ts, ts, user, text)
+        _bg(handle_thread_reply, client, channel, thread_ts, ts, user, text)
         return
     # Top-level community-channel message — proposal budget heads-up.
     if channel != CHANNEL:

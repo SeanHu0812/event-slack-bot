@@ -104,9 +104,15 @@ a rep to add must already exist in the `Reps` options (no junk options are creat
 "me/I" resolves to the sender via `REP_MAP_CSV`; if the event is ambiguous or a name can't
 be resolved, the bot asks to clarify instead of writing.
 
-The conversation can continue **in-thread**: once the bot has replied in a thread (or been
-@mentioned in one), a rep's follow-up replies there — with no new @mention — are picked up
-too, and prior thread messages are given to Claude so "the one on the 24th" / "yes" resolve.
+The conversation can continue **in-thread**: any reply in a thread where Event-Bot has
+posted is read — with no new @mention needed (recognized even after a restart by reading
+the thread) — and prior thread messages are given to Claude so "the one on the 24th" / "yes"
+resolve.
+
+If a rep says they **can't make an event but names no replacement**, the bot removes them and
+asks *"Who will be taking <name>'s place?"*, listing the reps **available that day** (those
+active this week and not already booked that day; plain names, no tags). The approver can
+just reply in the thread with a name to fill the slot.
 
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
