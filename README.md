@@ -110,9 +110,14 @@ the thread) — and prior thread messages are given to Claude so "the one on the
 resolve.
 
 If a rep says they **can't make an event but names no replacement**, the bot removes them and
-asks *"Who will be taking <name>'s place?"*, listing the reps **available that day** (those
-active this week and not already booked that day; plain names, no tags). The approver can
-just reply in the thread with a name to fill the slot.
+asks *"Who will be taking <name>'s place?"*, listing the **available reps** (plain names, no
+tags). The approver can just reply in the thread with a name to fill the slot.
+
+Availability is checked against reps' **real Google Calendars** (free/busy) at the event's
+time when a time is known — reps with a conflict are dropped; anyone whose free/busy is hidden
+is assumed free. If no event time is available, it falls back to "not already booked that day"
+from Notion. `/reps-availability` lists, for each of this week's events (with its time), which
+active reps are free — the same check, on demand.
 
 ### Behavior on edge cases
 - **Reaction fires twice** → dedup check finds the existing page, does nothing.
@@ -144,8 +149,8 @@ just reply in the thread with a name to fill the slot.
 - Event subscriptions (bot events): `reaction_added`, `message.channels`,
   **`app_mention`**, **`message.im`**.
 - Slash commands created (Features → Slash Commands): **`/check-budget`**,
-  **`/events-this-week`**, **`/my-event`**, **`/gcal-sync`**. In Socket Mode no Request
-  URL is needed.
+  **`/events-this-week`**, **`/my-event`**, **`/gcal-sync`**, **`/reps-availability`**.
+  In Socket Mode no Request URL is needed.
 - Bot invited to #community-team, **#ny-vc-squad**, and **#qualifiers-across-department**
   (`/invite @your-bot`).
 - Custom emoji **`:done:`** must exist in the workspace.

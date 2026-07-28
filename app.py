@@ -1114,34 +1114,87 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
     return ask_json(prompt, max_tokens=2000)
 
 
-def available_reps(date, exclude=()):
-    """Active reps (assigned to some event this week) not already booked on `date`,
-    excluding given names. Plain-text availability without touching calendars."""
+def active_reps_this_week():
+    """Reps assigned to any event this week — the practical replacement pool."""
+    return sorted({r for e in fetch_week_events() for r in e["reps"]})
+
+
+def calendar_busy(emails, start_iso, end_iso):
+    """Emails with a busy block overlapping [start, end] per Google free/busy.
+    Reps whose free/busy is hidden/unreadable simply don't appear busy (optimistic)."""
+    cal = calendar()
+    emails = [e for e in emails if e]
+    if cal is None or not (emails and start_iso and end_iso):
+        return set()
+    try:
+        resp = cal.freebusy().query(body={
+            "timeMin": start_iso, "timeMax": end_iso,
+            "items": [{"id": e} for e in emails[:50]]}).execute()
+    except Exception:
+        log.exception("free/busy query failed")
+        return set()
+    return {em.strip().lower() for em, info in (resp.get("calendars") or {}).items()
+            if info.get("busy")}
+
+
+def event_window(event):
+    """(start_iso, end_iso) for a rundown event — from its New-York-calendar clone,
+    else a same-day title match on the personal calendar. None if no timed match."""
+    cal = calendar()
+    if cal is None:
+        return None
+    src = find_clone(event["id"])
+    if not src:
+        try:
+            d = event["date"]
+            tmin = datetime.fromisoformat(d).replace(tzinfo=RUNDOWN_TZ).isoformat()
+            tmax = (datetime.fromisoformat(d) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
+            items = cal.events().list(calendarId=CAL_SOURCE, timeMin=tmin, timeMax=tmax,
+                                      singleEvents=True, maxResults=250).execute().get("items", [])
+        except Exception:
+            return None
+        n = _norm(event["event"])
+        src = next((it for it in items if _norm(it.get("summary")) == n
+                    or n in _norm(it.get("summary")) or _norm(it.get("summary")) in n), None)
+    if not src:
+        return None
+    s = (src.get("start") or {}).get("dateTime")
+    e = (src.get("end") or {}).get("dateTime")
+    return (s, e) if s and e else None
+
+
+def reps_available_for(event, exclude=(), window=None):
+    """Active reps free for this event: by real Google free/busy at the event's time
+    when a time is known, else 'not already booked that day' from Notion."""
     excl = {r.strip().lower() for r in exclude}
-    active, busy = set(), set()
-    for e in fetch_week_events():
-        for r in e["reps"]:
-            active.add(r)
-            if e["date"] == date:
-                busy.add(r)
-    return sorted(r for r in active - busy if r.strip().lower() not in excl)
+    pool = [r for r in active_reps_this_week() if r.strip().lower() not in excl]
+    if window is None:
+        window = event_window(event)
+    if window:
+        emails = rep_emails()
+        pool_email = {r: emails.get(r.strip().lower()) for r in pool}
+        busy = calendar_busy([e for e in pool_email.values() if e], window[0], window[1])
+        return [r for r in pool if (pool_email[r] or "").strip().lower() not in busy]
+    busyday = {r.strip().lower() for e in fetch_week_events()
+               if e["date"] == event["date"] for r in e["reps"]}
+    return [r for r in pool if r.strip().lower() not in busyday]
 
 
-def replacement_prompt(removed, date):
-    """Ask who is covering for a dropped rep and list who's free that day (no tags)."""
+def replacement_prompt(removed, event):
+    """Ask who is covering for a dropped rep and list who's free (no tags)."""
     if len(removed) == 1:
         n = removed[0]
         poss = f"{n}'" if n.endswith("s") else f"{n}'s"
         head = f"Who will be taking {poss} place?"
     else:
         head = "Who will be taking their place?"
-    avail = available_reps(date, exclude=removed)
+    avail = reps_available_for(event, exclude=removed)
     lines = [head]
     if avail:
         lines.append("The reps available that day are:")
         lines += [f"• {r}" for r in avail]
     else:
-        lines.append("(No other active reps look free that day.)")
+        lines.append("(No other active reps look free.)")
     return "\n".join(lines)
 
 
@@ -1224,7 +1277,7 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     if is_rundown:
         if needs_replacement:
             client.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                    text=replacement_prompt(removed, ev["date"]))
+                                    text=replacement_prompt(removed, ev))
         return
 
     # Otherwise (@mention / DM): a plain-text confirmation — no @-mentions, no pings.
@@ -1235,7 +1288,7 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
         parts.append("Added: " + ", ".join(add))
     if needs_replacement:
         parts.append("")
-        parts.append(replacement_prompt(removed, ev["date"]))
+        parts.append(replacement_prompt(removed, ev))
     else:
         parts.append("Reps now: " + (", ".join(new) or "none"))
     if invalid:
@@ -1503,6 +1556,39 @@ def _send_gcal_sync(client, channel, user):
     except Exception:
         client.chat_postMessage(channel=user, text=text)
     log.info("posted /gcal-sync report for %s", user)
+
+
+@app.command("/reps-availability")          # accept a couple of spellings
+@app.command("/reps-avail")
+def cmd_reps_availability(ack, body, client):
+    ack()
+    _bg(_send_reps_availability, client, body.get("channel_id"), body.get("user_id"))
+
+
+def _send_reps_availability(client, channel, user):
+    events = fetch_week_events()
+    if not events:
+        text = "No NYC events this week."
+    else:
+        lines = [":calendar: *Rep availability — this week*", ""]
+        for e in events:
+            window = event_window(e)
+            when = fmt_day(e["date"])
+            if window:
+                try:
+                    when += ", " + datetime.fromisoformat(window[0]).strftime("%-I:%M %p")
+                except Exception:
+                    pass
+            avail = reps_available_for(e, window=window)
+            lines.append(f"*{when} — {e['event']}*")
+            lines.append("Available: " + (", ".join(avail) if avail else "—"))
+            lines.append("")
+        text = "\n".join(lines).strip()
+    try:
+        client.chat_postEphemeral(channel=channel, user=user, text=text)
+    except Exception:
+        client.chat_postMessage(channel=user, text=text)
+    log.info("posted /reps-availability for %s", user)
 
 
 class _Health(BaseHTTPRequestHandler):
