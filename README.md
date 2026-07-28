@@ -75,9 +75,12 @@ duplicates (whether the event was cloned earlier or added by other means). Best-
 throughout (a calendar failure never blocks the Slack/Notion flows). Requires the OAuth
 env vars below; skipped without them.
 
-`/gcal-sync` is a read-only health check: for each of this week's events it reports whether
-it's on the New York calendar and whether that event's guest list matches the current Notion
-reps (flagging missing/extra guests). Makes no changes — use a reply/@mention to fix.
+`/gcal-sync` **actively reconciles** the New York calendar to this week's rundown: it clones
+any missing events (with guests, initial invite) and aligns existing events' guest lists to
+the current Notion reps (silently, no email), then replies with the actions it performed
+(e.g. "Cloned X with 3 guests", "Updated guests on Y (+Marc, -Joe)"). The same reconcile runs
+automatically with the Monday rundown. Idempotent — an already-aligned calendar reports "no
+changes needed".
 
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists

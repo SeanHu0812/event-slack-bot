@@ -605,9 +605,9 @@ def post_rundown(client, events):
             log.exception("failed to post rundown to %s", ch)
     log.info("posted weekly rundown to %s (%d events)", RUNDOWN_CHANNELS, len(events))
     try:
-        clone_week_events()                        # mirror this week's events to gcal
+        reconcile_calendar()                       # mirror this week's events to gcal
     except Exception:
-        log.exception("weekly calendar clone failed")
+        log.exception("weekly calendar sync failed")
 
 
 def thread_parent_is_rundown(client, channel, thread_ts):
@@ -783,56 +783,100 @@ def _match_calendar_sources(events, cal_events):
     return result
 
 
-def clone_week_events():
-    """Clone this week's rundown events from the personal calendar to the shared
-    New York calendar, adding assigned reps as guests. Idempotent + best-effort."""
+def reconcile_calendar():
+    """Make the New York calendar match this week's rundown: clone missing events
+    (with guests, initial invite) and align existing clones' guest lists to Notion
+    (silently). Returns a list of action strings, or None if calendar isn't set up."""
     cal = calendar()
     if cal is None:
-        log.info("calendar not configured; skipping clone")
-        return
+        return None
     events = fetch_week_events()
     if not events:
-        return
-    monday, sunday = week_range()
-    tmin = datetime.fromisoformat(monday).replace(tzinfo=RUNDOWN_TZ).isoformat()
-    tmax = (datetime.fromisoformat(sunday) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
-    try:
-        src_events = cal.events().list(
-            calendarId=CAL_SOURCE, timeMin=tmin, timeMax=tmax,
-            singleEvents=True, orderBy="startTime", maxResults=250).execute().get("items", [])
-    except Exception:
-        log.exception("could not read personal calendar; skipping clone")
-        return
-    src_events = [e for e in src_events if e.get("start", {}).get("dateTime")]
-    matches = _match_calendar_sources(events, src_events)
+        return []
     emails = rep_emails()
+    known = {v.strip().lower() for v in emails.values()}
+
+    clones = {e["id"]: find_clone(e["id"]) for e in events}
+    src_events, matches = [], {}
+    if any(clones[e["id"]] is None for e in events):     # only fetch/match if we must clone
+        monday, sunday = week_range()
+        tmin = datetime.fromisoformat(monday).replace(tzinfo=RUNDOWN_TZ).isoformat()
+        tmax = (datetime.fromisoformat(sunday) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
+        try:
+            src_events = cal.events().list(
+                calendarId=CAL_SOURCE, timeMin=tmin, timeMax=tmax,
+                singleEvents=True, orderBy="startTime", maxResults=250).execute().get("items", [])
+        except Exception:
+            log.exception("could not read personal calendar")
+        src_events = [s for s in src_events if s.get("start", {}).get("dateTime")]
+        matches = _match_calendar_sources(events, src_events)
+
+    actions = []
     for i, e in enumerate(events):
+        # Expected guest set for this event (reps that have an email), + display names.
+        name_of, attendees = {}, []
+        for r in e["reps"]:
+            em = emails.get(r.strip().lower())
+            if em:
+                attendees.append({"email": em})
+                name_of[em.strip().lower()] = r
+        expected = set(name_of)
+
+        clone = clones[e["id"]]
+        if clone:                                        # already cloned -> align guests
+            actual = {a["email"].strip().lower() for a in clone.get("attendees", [])
+                      if a.get("email")} & known
+            if actual == expected:
+                continue                                 # already in sync; nothing to do
+            try:
+                cal.events().patch(calendarId=CAL_TARGET, eventId=clone["id"],
+                                   body={"attendees": attendees}, sendUpdates="none").execute()
+                bits = []
+                if expected - actual:
+                    bits.append("+" + ", ".join(sorted(name_of[m] for m in expected - actual)))
+                if actual - expected:
+                    bits.append("-" + ", ".join(sorted(actual - expected)))
+                actions.append(f":arrows_counterclockwise: Updated guests on *{e['event']}* "
+                               f"({'; '.join(bits)})")
+            except Exception:
+                log.exception("failed to align guests for %r", e["event"])
+                actions.append(f":x: Couldn't update guests on *{e['event']}*")
+            continue
+
+        # Not on the calendar yet -> clone it from the personal calendar.
         ci = matches.get(i)
         if ci is None or not 0 <= ci < len(src_events):
-            log.info("no calendar source for %r; skipping clone", e["event"])
+            actions.append(f":warning: No calendar source found for *{e['event']}* — not cloned")
             continue
         src = src_events[ci]
-        if find_clone(e["id"]):
-            log.info("already cloned %r; skipping", e["event"])
-            continue
         src_date = (src.get("start", {}).get("dateTime") or "")[:10]
         if target_has_event(src.get("summary"), src_date):
-            log.info("%r already on the New York calendar; skipping to avoid a dupe", e["event"])
+            actions.append(f":information_source: *{e['event']}* already on the calendar "
+                           "(not linked to Notion) — left as is")
             continue
         body = {
-            "summary": src.get("summary"),
-            "start": src.get("start"),
-            "end": src.get("end"),
-            "location": src.get("location"),
-            "description": src.get("description"),
-            "attendees": _rep_attendees(e["reps"], emails),
+            "summary": src.get("summary"), "start": src.get("start"), "end": src.get("end"),
+            "location": src.get("location"), "description": src.get("description"),
+            "attendees": attendees,
             "extendedProperties": {"private": {"notionPageId": e["id"]}},
         }
         try:
             cal.events().insert(calendarId=CAL_TARGET, body=body, sendUpdates="all").execute()
-            log.info("cloned %r with %d guest(s)", e["event"], len(body["attendees"]))
+            actions.append(f":new: Cloned *{e['event']}* with {len(attendees)} guest(s)")
         except Exception:
             log.exception("failed to clone %r", e["event"])
+            actions.append(f":x: Couldn't clone *{e['event']}*")
+    return actions
+
+
+def run_gcal_sync():
+    """Reconcile the calendar and return a Slack message of the actions taken."""
+    actions = reconcile_calendar()
+    if actions is None:
+        return "Google Calendar isn't configured (missing OAuth secrets), so I can't sync."
+    if not actions:
+        return ":white_check_mark: Calendar already matches this week's rundown — no changes needed."
+    return ":calendar: *Calendar synced — here's what I did:*\n" + "\n".join(actions)
 
 
 def update_calendar_guests(page_id, rep_names):
@@ -848,45 +892,6 @@ def update_calendar_guests(page_id, rep_names):
         log.info("updated calendar guests for %s (%d)", page_id, len(attendees))
     except Exception:
         log.exception("failed to update calendar guests for %s", page_id)
-
-
-def gcal_sync_report():
-    """Read-only check: are this week's events on the New York calendar, and do
-    their guest lists match the current Notion reps? Returns a Slack report."""
-    if calendar() is None:
-        return "Google Calendar isn't configured (missing OAuth secrets), so I can't check sync."
-    events = fetch_week_events()
-    if not events:
-        return "No NYC events this week to check."
-    emails = rep_emails()
-    known = set(emails.values())               # all rep emails, to ignore organizer/resources
-    lines = [":calendar: *Calendar sync check — this week*", ""]
-    all_ok = True
-    for e in sorted(events, key=lambda x: x["date"]):
-        head = f"• {fmt_day(e['date'])} — {e['event']}"
-        name_of = {emails[r.strip().lower()]: r for r in e["reps"] if r.strip().lower() in emails}
-        expected = set(name_of)
-        clone = find_clone(e["id"])
-        if not clone:
-            all_ok = False
-            lines.append(f"{head}: :x: not on the New York calendar")
-            continue
-        # Compare only against known rep emails (ignore any organizer/resource entries).
-        actual = {a["email"].strip().lower() for a in clone.get("attendees", []) if a.get("email")}
-        actual &= known
-        if actual == expected:
-            lines.append(f"{head}: :white_check_mark: on calendar · guests match ({len(expected)})")
-            continue
-        all_ok = False
-        detail = []
-        if expected - actual:
-            detail.append("missing " + ", ".join(sorted(name_of.get(m, m) for m in expected - actual)))
-        if actual - expected:
-            detail.append("extra " + ", ".join(sorted(actual - expected)))
-        lines.append(f"{head}: :warning: guest mismatch — " + "; ".join(detail))
-    lines += ["", ":white_check_mark: Everything's in sync." if all_ok
-              else "Some items are out of sync — reply/@mention me to fix an assignment."]
-    return "\n".join(lines)
 
 
 def run_weekly_rundown(client):
@@ -1426,7 +1431,7 @@ def cmd_gcal_sync(ack, body, client):
 
 
 def _send_gcal_sync(client, channel, user):
-    text = gcal_sync_report()
+    text = run_gcal_sync()
     try:
         client.chat_postEphemeral(channel=channel, user=user, text=text)
     except Exception:
