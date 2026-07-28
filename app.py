@@ -743,22 +743,9 @@ def _norm(s):
     return " ".join((s or "").split()).strip().lower()
 
 
-def target_has_event(summary, date):
-    """Is an event with this title already on the New York calendar that day?
-    Guards against duplicating events that got there by any means (not just ours)."""
-    cal = calendar()
-    if cal is None or not date:
-        return False
-    try:
-        tmin = datetime.fromisoformat(date).replace(tzinfo=RUNDOWN_TZ).isoformat()
-        tmax = (datetime.fromisoformat(date) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
-        items = cal.events().list(
-            calendarId=CAL_TARGET, timeMin=tmin, timeMax=tmax,
-            singleEvents=True, maxResults=250).execute().get("items", [])
-    except Exception:
-        log.exception("target-calendar dupe check failed for %r", summary)
-        return False
-    return any(_norm(it.get("summary")) == _norm(summary) for it in items)
+def _ev_date(ev):
+    s = ev.get("start", {})
+    return (s.get("dateTime") or s.get("date") or "")[:10]
 
 
 def _match_calendar_sources(events, cal_events):
@@ -785,9 +772,11 @@ def _match_calendar_sources(events, cal_events):
 
 
 def reconcile_calendar():
-    """Make the New York calendar match this week's rundown: clone missing events
-    (with guests, initial invite) and align existing clones' guest lists to Notion
-    (silently). Returns a list of action strings, or None if calendar isn't set up."""
+    """Make the New York calendar match this week's rundown (Notion = source of truth):
+    clone missing events (guests + invite), and align guest lists on events already there —
+    including pre-existing copies the bot didn't create, which it adopts (stamps) and manages
+    while preserving any non-rep guests. Guest changes are silent (no email). Returns a list
+    of action strings, or None if the calendar isn't configured."""
     cal = calendar()
     if cal is None:
         return None
@@ -796,74 +785,106 @@ def reconcile_calendar():
         return []
     emails = rep_emails()
     known = {v.strip().lower() for v in emails.values()}
+    monday, sunday = week_range()
+    tmin = datetime.fromisoformat(monday).replace(tzinfo=RUNDOWN_TZ).isoformat()
+    tmax = (datetime.fromisoformat(sunday) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
 
-    clones = {e["id"]: find_clone(e["id"]) for e in events}
+    # Everything already on the New York calendar this week (one read).
+    try:
+        target = cal.events().list(
+            calendarId=CAL_TARGET, timeMin=tmin, timeMax=tmax,
+            singleEvents=True, maxResults=250).execute().get("items", [])
+    except Exception:
+        log.exception("could not read the New York calendar")
+        return None
+    by_stamp = {}
+    for ev in target:
+        pid = ((ev.get("extendedProperties") or {}).get("private") or {}).get("notionPageId")
+        if pid:
+            by_stamp[pid] = ev
+
+    # Personal-calendar sources — only needed when something isn't already on the target.
     src_events, matches = [], {}
-    if any(clones[e["id"]] is None for e in events):     # only fetch/match if we must clone
-        monday, sunday = week_range()
-        tmin = datetime.fromisoformat(monday).replace(tzinfo=RUNDOWN_TZ).isoformat()
-        tmax = (datetime.fromisoformat(sunday) + timedelta(days=1)).replace(tzinfo=RUNDOWN_TZ).isoformat()
+    if any(e["id"] not in by_stamp for e in events):
         try:
             src_events = cal.events().list(
                 calendarId=CAL_SOURCE, timeMin=tmin, timeMax=tmax,
                 singleEvents=True, orderBy="startTime", maxResults=250).execute().get("items", [])
         except Exception:
-            log.exception("could not read personal calendar")
+            log.exception("could not read the personal calendar")
         src_events = [s for s in src_events if s.get("start", {}).get("dateTime")]
         matches = _match_calendar_sources(events, src_events)
 
     actions = []
     for i, e in enumerate(events):
-        # Expected guest set for this event (reps that have an email), + display names.
-        name_of, attendees = {}, []
+        # Desired rep guests (reps that have an email in the sheet), + display names.
+        name_of, desired = {}, []
         for r in e["reps"]:
             em = emails.get(r.strip().lower())
             if em:
-                attendees.append({"email": em})
+                desired.append({"email": em})
                 name_of[em.strip().lower()] = r
-        expected = set(name_of)
+        desired_set = set(name_of)
 
-        clone = clones[e["id"]]
-        if clone:                                        # already cloned -> align guests
-            actual = {a["email"].strip().lower() for a in clone.get("attendees", [])
-                      if a.get("email")} & known
-            if actual == expected:
-                continue                                 # already in sync; nothing to do
+        # Locate the copy on the target: by our stamp, else by a same-day title match.
+        clone, adopt = by_stamp.get(e["id"]), False
+        if clone is None:
+            titles = {_norm(e["event"])}
+            ci = matches.get(i)
+            if ci is not None and 0 <= ci < len(src_events):
+                titles.add(_norm(src_events[ci].get("summary")))
+            clone = next((ev for ev in target
+                          if _ev_date(ev) == e["date"] and _norm(ev.get("summary")) in titles), None)
+            adopt = clone is not None
+
+        if clone is not None:                            # on the calendar -> align guests
+            existing = clone.get("attendees", [])
+            existing_reps = {a["email"].strip().lower() for a in existing
+                             if a.get("email")} & known
+            nonreps = [a for a in existing
+                       if a.get("email") and a["email"].strip().lower() not in known]
+            if existing_reps == desired_set and not adopt:
+                continue                                 # already in sync and already linked
+            body = {"attendees": nonreps + desired}      # keep non-rep guests; set reps to Notion
+            if adopt:                                    # stamp it so future syncs find it fast
+                priv = dict((clone.get("extendedProperties") or {}).get("private") or {})
+                priv["notionPageId"] = e["id"]
+                body["extendedProperties"] = {"private": priv}
             try:
                 cal.events().patch(calendarId=CAL_TARGET, eventId=clone["id"],
-                                   body={"attendees": attendees}, sendUpdates="none").execute()
+                                   body=body, sendUpdates="none").execute()
+            except Exception:
+                log.exception("failed to update %r on the calendar", e["event"])
+                actions.append(f":x: Couldn't update *{e['event']}*")
+                continue
+            if adopt:
+                actions.append(f":link: Adopted *{e['event']}* (already on the calendar) — "
+                               f"guests set to {len(desired)}")
+            else:
                 bits = []
-                if expected - actual:
-                    bits.append("+" + ", ".join(sorted(name_of[m] for m in expected - actual)))
-                if actual - expected:
-                    bits.append("-" + ", ".join(sorted(actual - expected)))
+                if desired_set - existing_reps:
+                    bits.append("+" + ", ".join(sorted(name_of[m] for m in desired_set - existing_reps)))
+                if existing_reps - desired_set:
+                    bits.append("-" + ", ".join(sorted(existing_reps - desired_set)))
                 actions.append(f":arrows_counterclockwise: Updated guests on *{e['event']}* "
                                f"({'; '.join(bits)})")
-            except Exception:
-                log.exception("failed to align guests for %r", e["event"])
-                actions.append(f":x: Couldn't update guests on *{e['event']}*")
             continue
 
-        # Not on the calendar yet -> clone it from the personal calendar.
+        # Not on the target at all -> clone from the personal calendar.
         ci = matches.get(i)
         if ci is None or not 0 <= ci < len(src_events):
             actions.append(f":warning: No calendar source found for *{e['event']}* — not cloned")
             continue
         src = src_events[ci]
-        src_date = (src.get("start", {}).get("dateTime") or "")[:10]
-        if target_has_event(src.get("summary"), src_date):
-            actions.append(f":information_source: *{e['event']}* already on the calendar "
-                           "(not linked to Notion) — left as is")
-            continue
         body = {
             "summary": src.get("summary"), "start": src.get("start"), "end": src.get("end"),
             "location": src.get("location"), "description": src.get("description"),
-            "attendees": attendees,
+            "attendees": desired,
             "extendedProperties": {"private": {"notionPageId": e["id"]}},
         }
         try:
             cal.events().insert(calendarId=CAL_TARGET, body=body, sendUpdates="all").execute()
-            actions.append(f":new: Cloned *{e['event']}* with {len(attendees)} guest(s)")
+            actions.append(f":new: Cloned *{e['event']}* with {len(desired)} guest(s)")
         except Exception:
             log.exception("failed to clone %r", e["event"])
             actions.append(f":x: Couldn't clone *{e['event']}*")

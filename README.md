@@ -69,17 +69,19 @@ title, and **adds the assigned reps as guests** (emails from the rep sheet's ema
 The initial clone sends an invite; the event is stamped with its Notion page id so it can
 be found later. When reps change in Notion (any @mention/DM/reply), the bot **updates the
 cloned event's guest list with no email** (`sendUpdates=none`) — so reps aren't spammed.
-Before creating anything it **checks the New York calendar** and skips an event that's
-already there — by our Notion-page stamp *or* by a same-day title match — so it never
-duplicates (whether the event was cloned earlier or added by other means). Best-effort
-throughout (a calendar failure never blocks the Slack/Notion flows). Requires the OAuth
-env vars below; skipped without them.
+It locates each event on the New York calendar by our Notion-page stamp *or* a same-day
+title match, so it never duplicates. A copy that's already there but not created by the bot
+(added manually / by Luma) is **adopted**: stamped and its guest list brought in line with
+Notion, while any non-rep guests on it are preserved. Best-effort throughout (a calendar
+failure never blocks the Slack/Notion flows). Requires the OAuth env vars below; skipped
+without them.
 
-`/gcal-sync` **actively reconciles** the New York calendar to this week's rundown: it clones
-any missing events (with guests, initial invite) and aligns existing events' guest lists to
-the current Notion reps (silently, no email), then replies with the actions it performed
-(e.g. "Cloned X with 3 guests", "Updated guests on Y (+Marc, -Joe)"). The same reconcile runs
-automatically with the Monday rundown. Idempotent — an already-aligned calendar reports "no
+`/gcal-sync` **actively reconciles** the New York calendar to this week's rundown and reports
+what it did: clones missing events (guests + initial invite), aligns guest lists on events
+already there — including adopting pre-existing copies — to the current Notion reps (silently,
+no email), preserving any non-rep guests. Actions read like "Cloned X with 3 guests",
+"Updated guests on Y (+Marc, -Joe)", "Adopted Z (already on the calendar) — guests set to 2".
+The same reconcile runs with the Monday rundown; an already-aligned calendar reports "no
 changes needed".
 
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
