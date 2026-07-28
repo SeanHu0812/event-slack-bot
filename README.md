@@ -145,9 +145,11 @@ active reps are free — the same check, on demand.
 - Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
   **`reactions:write`** (seed ✅/:done: reactions), **`commands`** (slash commands),
   **`im:write`** + **`im:history`** (DM Drew / accept rep DMs), **`app_mentions:read`**
-  (accept @mentions).
+  (accept @mentions), **`groups:history`** (read/edit rundowns in the **private**
+  #qualifiers-across-department channel — without it, edits there silently fail).
 - Event subscriptions (bot events): `reaction_added`, `message.channels`,
-  **`app_mention`**, **`message.im`**.
+  **`message.groups`** (replies in the private channel), **`app_mention`**, **`message.im`**.
+- The bot must be a **member** of every channel it posts to (public *and* private).
 - Slash commands created (Features → Slash Commands): **`/check-budget`**,
   **`/events-this-week`**, **`/my-event`**, **`/gcal-sync`**, **`/reps-availability`**.
   In Socket Mode no Request URL is needed.

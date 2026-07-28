@@ -610,37 +610,40 @@ def post_rundown(client, events):
         log.exception("weekly calendar sync failed")
 
 
-def find_rundown_ts(client, channel):
-    """The ts of the current rundown message in a channel: from memory if tracked,
-    else the latest bot rundown message in recent history (restart-safe)."""
-    for ch, ts in _rundown_msgs:
-        if ch == channel:
-            return ts
+def rundown_ts_all(client, channel):
+    """Every rundown message the bot posted THIS WEEK in a channel — from memory
+    plus a history scan — so duplicate posts all stay in sync. Logs read errors
+    (missing scope / not in channel) instead of hiding them."""
+    found = {ts for ch, ts in _rundown_msgs if ch == channel}
+    start = week_start_epoch()
     try:
-        msgs = client.conversations_history(channel=channel, limit=100)["messages"]
+        msgs = client.conversations_history(channel=channel, limit=200)["messages"]
     except Exception:
-        return None
-    for m in msgs:                                 # newest first
-        if (m.get("bot_id") or m.get("user") == BOT_USER_ID) and \
-                RUNDOWN_SENTINEL in (m.get("text") or ""):
-            return m["ts"]
-    return None
+        log.exception("couldn't read history of %s (bot not in channel? missing scope?)", channel)
+        return sorted(found)
+    for m in msgs:
+        if (m.get("bot_id") or m.get("user") == BOT_USER_ID) \
+                and RUNDOWN_SENTINEL in (m.get("text") or "") \
+                and float(m.get("ts", 0)) >= start:
+            found.add(m["ts"])
+    if not found:
+        log.warning("no rundown message found in %s (scanned %d msgs this week)", channel, len(msgs))
+    return sorted(found)
 
 
 def edit_rundowns(client):
-    """Regenerate the rundown from current Notion data and edit it in place in
-    EVERY rundown channel, so #ny-vc-squad and #qualifiers stay in sync."""
+    """Regenerate the rundown from current Notion data and edit EVERY rundown
+    message this week in each channel in place, so all copies stay in sync."""
     text = build_rundown(fetch_week_events())
+    edited = 0
     for ch in RUNDOWN_CHANNELS:
-        ts = find_rundown_ts(client, ch)
-        if not ts:
-            log.warning("no rundown message found in %s to edit", ch)
-            continue
-        try:
-            client.chat_update(channel=ch, ts=ts, text=text)
-        except Exception:
-            log.exception("failed to update rundown in %s", ch)
-    log.info("edited rundown in %s", RUNDOWN_CHANNELS)
+        for ts in rundown_ts_all(client, ch):
+            try:
+                client.chat_update(channel=ch, ts=ts, text=text)
+                edited += 1
+            except Exception:
+                log.exception("failed to update rundown %s/%s", ch, ts)
+    log.info("edited %d rundown message(s) across %s", edited, RUNDOWN_CHANNELS)
 
 
 def send_reps_reminder(client, missing):
