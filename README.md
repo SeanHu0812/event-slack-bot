@@ -75,6 +75,10 @@ duplicates (whether the event was cloned earlier or added by other means). Best-
 throughout (a calendar failure never blocks the Slack/Notion flows). Requires the OAuth
 env vars below; skipped without them.
 
+`/gcal-sync` is a read-only health check: for each of this week's events it reports whether
+it's on the New York calendar and whether that event's guest list matches the current Notion
+reps (flagging missing/extra guests). Makes no changes — use a reply/@mention to fix.
+
 `/my-event` lets a rep see their own upcoming assignments (next 60 days, any city): the
 bot maps the caller's Slack ID back to their Notion rep name(s) via `REP_MAP_CSV` and lists
 the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet it says so.
@@ -129,7 +133,8 @@ too, and prior thread messages are given to Claude so "the one on the 24th" / "y
 - Event subscriptions (bot events): `reaction_added`, `message.channels`,
   **`app_mention`**, **`message.im`**.
 - Slash commands created (Features → Slash Commands): **`/check-budget`**,
-  **`/events-this-week`**, **`/my-event`**. In Socket Mode no Request URL is needed.
+  **`/events-this-week`**, **`/my-event`**, **`/gcal-sync`**. In Socket Mode no Request
+  URL is needed.
 - Bot invited to #community-team, **#ny-vc-squad**, and **#qualifiers-across-department**
   (`/invite @your-bot`).
 - Custom emoji **`:done:`** must exist in the workspace.

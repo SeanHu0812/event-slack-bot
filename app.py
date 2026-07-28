@@ -850,6 +850,45 @@ def update_calendar_guests(page_id, rep_names):
         log.exception("failed to update calendar guests for %s", page_id)
 
 
+def gcal_sync_report():
+    """Read-only check: are this week's events on the New York calendar, and do
+    their guest lists match the current Notion reps? Returns a Slack report."""
+    if calendar() is None:
+        return "Google Calendar isn't configured (missing OAuth secrets), so I can't check sync."
+    events = fetch_week_events()
+    if not events:
+        return "No NYC events this week to check."
+    emails = rep_emails()
+    known = set(emails.values())               # all rep emails, to ignore organizer/resources
+    lines = [":calendar: *Calendar sync check — this week*", ""]
+    all_ok = True
+    for e in sorted(events, key=lambda x: x["date"]):
+        head = f"• {fmt_day(e['date'])} — {e['event']}"
+        name_of = {emails[r.strip().lower()]: r for r in e["reps"] if r.strip().lower() in emails}
+        expected = set(name_of)
+        clone = find_clone(e["id"])
+        if not clone:
+            all_ok = False
+            lines.append(f"{head}: :x: not on the New York calendar")
+            continue
+        # Compare only against known rep emails (ignore any organizer/resource entries).
+        actual = {a["email"].strip().lower() for a in clone.get("attendees", []) if a.get("email")}
+        actual &= known
+        if actual == expected:
+            lines.append(f"{head}: :white_check_mark: on calendar · guests match ({len(expected)})")
+            continue
+        all_ok = False
+        detail = []
+        if expected - actual:
+            detail.append("missing " + ", ".join(sorted(name_of.get(m, m) for m in expected - actual)))
+        if actual - expected:
+            detail.append("extra " + ", ".join(sorted(actual - expected)))
+        lines.append(f"{head}: :warning: guest mismatch — " + "; ".join(detail))
+    lines += ["", ":white_check_mark: Everything's in sync." if all_ok
+              else "Some items are out of sync — reply/@mention me to fix an assignment."]
+    return "\n".join(lines)
+
+
 def run_weekly_rundown(client):
     """Monday 10am job: post the rundown, or nudge Drew if reps are missing."""
     events = fetch_week_events()
@@ -1377,6 +1416,22 @@ def _send_my_events(client, channel, user):
     except Exception:
         client.chat_postMessage(channel=user, text=text)
     log.info("posted /my-event for %s", user)
+
+
+@app.command("/gcal-sync")          # accept a couple of spellings
+@app.command("/gcalsync")
+def cmd_gcal_sync(ack, body, client):
+    ack()
+    _bg(_send_gcal_sync, client, body.get("channel_id"), body.get("user_id"))
+
+
+def _send_gcal_sync(client, channel, user):
+    text = gcal_sync_report()
+    try:
+        client.chat_postEphemeral(channel=channel, user=user, text=text)
+    except Exception:
+        client.chat_postMessage(channel=user, text=text)
+    log.info("posted /gcal-sync report for %s", user)
 
 
 class _Health(BaseHTTPRequestHandler):
