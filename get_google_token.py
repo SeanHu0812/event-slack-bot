@@ -12,7 +12,8 @@ secret (along with the same client id/secret). You only do this once.
 import os
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = ["https://www.googleapis.com/auth/calendar",
+          "https://www.googleapis.com/auth/drive.readonly"]
 
 client_id = os.environ["GOOGLE_OAUTH_CLIENT_ID"]
 client_secret = os.environ["GOOGLE_OAUTH_CLIENT_SECRET"]

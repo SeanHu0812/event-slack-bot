@@ -58,6 +58,7 @@ _rundown_msgs = set()                    # (channel, ts) of the latest rundown p
 CAL_SOURCE = "sean.hu@rho.co"            # personal calendar events are cloned FROM
 CAL_TARGET = ("c_a6779362659cf757210d14e15b7010a789e7c861a40c61957bb120527c5d550a"
               "@group.calendar.google.com")   # New York Event Calendar
+ENRICHMENT_FOLDER_ID = "1pgMUAiBOOVFMleeGuPSFKi5-IXyjNpCB"   # Drive: Enrichment OUTPUT (lead lists)
 # Channel IDs to post the rundown to (bot must be invited to each).
 # Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
 RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
@@ -664,29 +665,107 @@ def send_reps_reminder(client, missing):
 # Google Calendar sync (clone rundown events + keep guests in step with Notion)
 # ---------------------------------------------------------------------------
 
-_calendar = None
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar",
+                 "https://www.googleapis.com/auth/drive.readonly"]
+_google_creds = _calendar = _drive = None
+
+
+def google_creds():
+    """OAuth credentials acting as Sean (shared by Calendar + Drive). None if the
+    libs or OAuth env vars aren't configured."""
+    global _google_creds
+    if _google_creds is None:
+        if not _CALENDAR_AVAILABLE:
+            return None
+        cid = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+        csec = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+        rtok = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+        if not (cid and csec and rtok):
+            return None
+        _google_creds = OAuthCredentials(
+            None, refresh_token=rtok, client_id=cid, client_secret=csec,
+            token_uri="https://oauth2.googleapis.com/token", scopes=GOOGLE_SCOPES)
+    return _google_creds
 
 
 def calendar():
-    """Google Calendar client acting as Sean via OAuth (a service account can't
-    invite guests). None if the libs or OAuth env vars aren't configured."""
+    """Google Calendar client (acting as Sean — a service account can't invite guests)."""
     global _calendar
-    if _calendar is not None:
-        return _calendar
-    if not _CALENDAR_AVAILABLE:
-        return None
-    cid = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
-    csec = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
-    rtok = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
-    if not (cid and csec and rtok):
-        return None
-    creds = OAuthCredentials(
-        None, refresh_token=rtok, client_id=cid, client_secret=csec,
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/calendar"])
-    _calendar = gcal_build("calendar", "v3", credentials=creds, cache_discovery=False)
-    log.info("google calendar client ready (acting as %s)", CAL_SOURCE)
+    if _calendar is None:
+        creds = google_creds()
+        if creds is None:
+            return None
+        _calendar = gcal_build("calendar", "v3", credentials=creds, cache_discovery=False)
+        log.info("google calendar client ready (acting as %s)", CAL_SOURCE)
     return _calendar
+
+
+def drive():
+    """Google Drive client (read-only) for looking up lead lists. Needs the
+    drive.readonly scope on the OAuth token (re-mint if it was calendar-only)."""
+    global _drive
+    if _drive is None:
+        creds = google_creds()
+        if creds is None:
+            return None
+        _drive = gcal_build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive
+
+
+_LEAD_STOP = {"the", "and", "x", "hosted", "by", "for", "with", "rho", "event", "events",
+              "lead", "list", "leadlist", "enriched", "enrichment", "final", "copy", "of",
+              "xlsx", "csv", "sheet", "nyc"}
+
+
+def _lead_tokens(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if t not in _LEAD_STOP and len(t) > 2}
+
+
+def find_lead_list(event_name):
+    """Best-matching lead-list file in the Enrichment OUTPUT folder, or None.
+    Matches by name-token overlap and only returns a confident match."""
+    d = drive()
+    if d is None:
+        return None
+    try:
+        files = d.files().list(
+            q=f"'{ENRICHMENT_FOLDER_ID}' in parents and trashed=false",
+            fields="files(id,name,mimeType,webViewLink)", pageSize=1000,
+            supportsAllDrives=True, includeItemsFromAllDrives=True).execute().get("files", [])
+    except Exception:
+        log.exception("drive lead-list lookup failed (drive.readonly scope? folder shared?)")
+        return None
+    # Match on the core event name — strip "[Hosted by ...]" / "(...)" host qualifiers,
+    # which lead-list file names omit and which would otherwise dilute the overlap.
+    core = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", event_name)
+    et = _lead_tokens(core)
+    if not et:
+        return None
+    best, best_score = None, 0.0
+    for f in files:
+        score = len(et & _lead_tokens(f["name"])) / len(et)
+        if score > best_score:
+            best, best_score = f, score
+    return best if best and best_score >= 0.5 else None
+
+
+def send_lead_list(client, rep_name, event_name):
+    """DM a newly-assigned rep the event's lead list (if one exists). Skips silently
+    when there's no list or the rep has no Slack ID."""
+    sid = rep_map().get(rep_name.strip().lower())
+    if not sid:
+        return
+    lead = find_lead_list(event_name)
+    link = (lead or {}).get("webViewLink")
+    if not link:
+        return
+    try:
+        dm = client.conversations_open(users=sid)["channel"]["id"]
+        client.chat_postMessage(
+            channel=dm, text=f"Hi <@{sid}>, here's the <{link}|Lead List> for {event_name}")
+        log.info("sent lead list to %s for %r", rep_name, event_name)
+    except Exception:
+        log.exception("failed to send lead list to %s", rep_name)
 
 
 def rep_emails():
@@ -1271,6 +1350,13 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
         edit_rundowns(client)
     except Exception:
         log.exception("rundown refresh failed")
+
+    # DM each newly-assigned rep their event's lead list, if one exists.
+    for r in add:
+        try:
+            send_lead_list(client, r, ev["event"])
+        except Exception:
+            log.exception("lead-list send failed for %s", r)
 
     # A removal with no named replacement -> ask who's covering, listing free reps.
     needs_replacement = bool(removed) and not add

@@ -176,15 +176,25 @@ Month` table (Month / Estimated columns) — cells are located by content, not p
 - **Share the spreadsheet** with the service account's `client_email` (Viewer).
 - Tab titles must be exactly `NYC` and `SF`.
 
-## Google Calendar config (OAuth as Sean)
+## Google config (OAuth as Sean — Calendar + Drive)
 
-Calendar sync needs the bot to act as a real user (service accounts can't invite guests).
-1. Enable the **Google Calendar API**; use an OAuth **Client ID/Secret** (the one IT issued).
+Calendar sync needs the bot to act as a real user (service accounts can't invite guests);
+the lead-list lookup needs Drive read access.
+1. Enable the **Google Calendar API** and **Google Drive API**; use an OAuth
+   **Client ID/Secret** (the one IT issued).
 2. Run `get_google_token.py` **locally** once (signs in as `sean.hu@rho.co`, approves
-   calendar access) → prints a **refresh token**.
+   **calendar + drive.readonly**) → prints a **refresh token**. (If you minted a
+   calendar-only token earlier, re-run to add Drive — lead lists are skipped until you do.)
 3. Set `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN`.
 4. Add an **email column** to the rep-map tab (rep name → Slack ID → email) for guests.
-5. Sean must have edit access to the New York Event Calendar (he's the one being acted as).
+5. Sean must have edit access to the New York Event Calendar and read access to the
+   **Enrichment OUTPUT** Drive folder (he's the one being acted as).
+
+### Lead lists on new assignment
+When a rep is **newly added** to an event (any change path), the bot searches the
+Enrichment OUTPUT Drive folder for a matching lead-list file (by core event name, host
+qualifiers stripped) and DMs the rep: *"Hi @Rep, here's the [Lead List](link) for <event>"*.
+If no confident match is found, it skips silently.
 
 ## Notion config (already done)
 
