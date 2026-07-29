@@ -37,6 +37,16 @@ score leans on the others.
 **Triggers.** The bot assesses automatically when it detects a new proposal in the channel.
 Anyone can also react **👀 (`:eyes:`)** on any message to assess it on demand.
 
+**Self-learning.** Reply in an assessment thread (with or without @Event-Bot) to give the bot
+insight — e.g. "score open mixers lower" or "this partner always over-promises." The bot logs
+each reply as a *signal* to a Notion memory page. It deliberately **won't change its scoring
+off a single comment**: only once the same theme recurs (default 3 times, `LEARN_THRESHOLD`)
+does it distill those signals into a standing *guideline*, which is then injected into every
+future assessment. It replies in-thread to say whether it's still gathering the pattern or has
+adopted a new standard, and reacts 👍 to non-actionable replies. Set `ASSESSMENT_MEMORY_PAGE_ID`
+to a blank Notion page shared with the integration; without it, feedback is acknowledged but
+not persisted.
+
 **Enabling the revenue aspect (Snowflake).** Uncomment `snowflake-connector-python` in
 `requirements.txt`, redeploy, and set these as Replit secrets; without all of them the
 revenue aspect stays off:

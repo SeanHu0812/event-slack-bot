@@ -91,6 +91,14 @@ ASSESS_SENTINEL = "Event assessment"     # header text; also used to skip re-ass
 ASSESS_MIN_LEN = 40                      # ignore short chatter; proposals are longer
 ASSESS_EMOJI = "eyes"                    # 👀 — manually trigger an assessment on any message
 
+# Self-learning: people reply in an assessment thread with insight; the bot logs
+# each signal to a Notion "memory" page and, once a theme recurs, distills it into
+# a guideline that gets injected into future assessments. Set ASSESSMENT_MEMORY_PAGE_ID
+# to a blank Notion page shared with the integration; without it, learning is disabled.
+MEMORY_PAGE_ID = os.environ.get("ASSESSMENT_MEMORY_PAGE_ID")
+LEARN_THRESHOLD = 3                      # signals on one theme before it becomes a guideline
+_assessment_threads = set()              # (channel, proposal_ts) where we posted an assessment
+
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
 claude = Anthropic()
@@ -1577,7 +1585,7 @@ def assess_proposal(fields, text):
         "You are assessing whether Rho should invest in a proposed community event. "
         f"Score it 1-10 across {aspects} aspects and give a short reason for each. Base your "
         "judgement ONLY on the material below; never invent history or numbers.\n\n"
-        "=== BUSINESS-GOAL FRAMEWORK ===\n" + BUSINESS_FRAMEWORK + "\n"
+        "=== BUSINESS-GOAL FRAMEWORK ===\n" + BUSINESS_FRAMEWORK + learned_guidelines_text() + "\n"
         "=== PAST FEEDBACK (from prior events with this partner or similar formats) ===\n"
         + fb + "\n\n"
         + revenue_section +
@@ -1637,6 +1645,228 @@ def already_assessed(client, ts):
         return False
     return any((m.get("bot_id") or m.get("user") == BOT_USER_ID)
                and ASSESS_SENTINEL in (m.get("text") or "") for m in msgs)
+
+
+# --- Self-learning memory (Notion-backed) -----------------------------------
+# The memory page holds one paragraph block per entry, each a JSON line prefixed
+# "SIGNAL " (a raw insight) or "GUIDELINE " (a distilled, active standard).
+_SIG_PREFIX = "SIGNAL "
+_GUIDE_PREFIX = "GUIDELINE "
+_memory_cache = None
+_memory_ts = 0.0
+_MEMORY_TTL = 60
+
+
+def memory_enabled():
+    return bool(MEMORY_PAGE_ID)
+
+
+def _block_text(block):
+    t = block.get("type")
+    return _plain((block.get(t) or {}).get("rich_text") or []) if t else ""
+
+
+def _memory_blocks():
+    """(block_id, text) for every paragraph on the memory page."""
+    out, cursor = [], None
+    while True:
+        kw = {"block_id": MEMORY_PAGE_ID, "page_size": 100}
+        if cursor:
+            kw["start_cursor"] = cursor
+        r = notion.blocks.children.list(**kw)
+        out += [(b["id"], _block_text(b)) for b in r["results"]]
+        if not r.get("has_more"):
+            return out
+        cursor = r.get("next_cursor")
+
+
+def _append_memory(line):
+    notion.blocks.children.append(block_id=MEMORY_PAGE_ID, children=[{
+        "object": "block", "type": "paragraph",
+        "paragraph": {"rich_text": [{"type": "text", "text": {"content": line[:1900]}}]}}])
+
+
+def _invalidate_memory():
+    global _memory_ts
+    _memory_ts = 0.0
+
+
+def load_memory():
+    """(signals, guidelines) parsed from the memory page. Cached briefly. Each
+    guideline carries a private '_bid' (its block id) for in-place updates."""
+    global _memory_cache, _memory_ts
+    if not MEMORY_PAGE_ID:
+        return ([], [])
+    if _memory_cache is not None and (time.time() - _memory_ts) < _MEMORY_TTL:
+        return _memory_cache
+    signals, guidelines = [], []
+    try:
+        for bid, txt in _memory_blocks():
+            if txt.startswith(_SIG_PREFIX):
+                try:
+                    signals.append(json.loads(txt[len(_SIG_PREFIX):]))
+                except json.JSONDecodeError:
+                    pass
+            elif txt.startswith(_GUIDE_PREFIX):
+                try:
+                    g = json.loads(txt[len(_GUIDE_PREFIX):])
+                    g["_bid"] = bid
+                    guidelines.append(g)
+                except json.JSONDecodeError:
+                    pass
+    except Exception:
+        log.exception("could not read assessment memory page (is it shared with the integration?)")
+        return ([], [])
+    _memory_cache, _memory_ts = (signals, guidelines), time.time()
+    return _memory_cache
+
+
+def learned_guidelines_text():
+    """Active learned guidelines, formatted to append to the framework prompt."""
+    _, guidelines = load_memory()
+    active = [g["guideline"] for g in guidelines
+              if g.get("active", True) and g.get("guideline")]
+    if not active:
+        return ""
+    return ("\n\n=== LEARNED ADJUSTMENTS (from the team's feedback on past assessments; "
+            "apply these on top of the framework) ===\n"
+            + "\n".join(f"- {g}" for g in active) + "\n")
+
+
+def _extract_lesson(comment, proposal, assessment):
+    """Decide if a thread reply carries a generalizable assessment insight, and
+    normalize it into a guideline + grouping theme."""
+    prompt = (
+        "A Rho team member replied in the thread of an event-proposal assessment that I (a bot) "
+        "posted. Decide whether their reply contains a GENERALIZABLE insight about how event "
+        "proposals should be judged (a preference, a red/green flag, a weighting) — as opposed "
+        "to small talk, a one-off logistics note, or a question. If it does, phrase it as ONE "
+        "general, imperative guideline usable for FUTURE proposals (not specific to this event), "
+        "give a short kebab-case 'theme' to group similar insights, and a 'stance': 'raise', "
+        "'lower', or 'neutral'.\n\n"
+        f"PROPOSAL:\n{(proposal or '')[:1500]}\n\n"
+        f"MY ASSESSMENT:\n{(assessment or '')[:800]}\n\n"
+        f"THEIR REPLY:\n{(comment or '')[:1000]}\n\n"
+        "Return ONLY JSON: {\"actionable\": bool, \"lesson\": str, \"theme\": str, "
+        "\"stance\": \"raise|lower|neutral\"}."
+    )
+    return ask_json(prompt, max_tokens=400, model=FAST_MODEL) or {}
+
+
+def _distill_guideline(theme, signals):
+    """Turn several same-theme signals into one concise standing guideline."""
+    joined = "\n".join(f"- {s.get('lesson')}" for s in signals if s.get("lesson"))
+    prompt = (
+        "These are recurring pieces of feedback from Rho's events team about how to assess event "
+        f"proposals, all on the theme '{theme}':\n{joined}\n\n"
+        "Distill them into ONE concise, general assessment guideline (max 30 words, imperative) "
+        "to apply when scoring future proposals. Return ONLY JSON {\"guideline\": str}."
+    )
+    return (ask_json(prompt, max_tokens=200) or {}).get("guideline")
+
+
+def handle_assessment_feedback(client, channel, thread_ts, msg_ts, user, text):
+    """A reply in an assessment thread: capture the insight, and adjust the standard
+    only once a theme recurs (never off a single comment)."""
+    text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()
+    if len(text) < 3:
+        return
+    proposal, assessment = "", ""
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)["messages"]
+        proposal = (msgs[0].get("text") if msgs else "") or ""
+        for m in msgs:
+            if (m.get("bot_id") or m.get("user") == BOT_USER_ID) \
+                    and ASSESS_SENTINEL in (m.get("text") or ""):
+                assessment = m.get("text") or ""
+                break
+    except Exception:
+        pass
+
+    info = _extract_lesson(text, proposal, assessment)
+    if not info.get("actionable") or not info.get("lesson"):
+        try:                                      # low-noise acknowledgement
+            client.reactions_add(channel=channel, timestamp=msg_ts, name="+1")
+        except Exception:
+            pass
+        return
+
+    if not memory_enabled():
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="Thanks — noted. (Persistent learning isn't set up yet, so I can't save this "
+                 "across restarts. Ask an admin to configure the memory page.)")
+        return
+
+    lesson = info["lesson"].strip()
+    theme = (info.get("theme") or "general").strip().lower()
+    signal = {"lesson": lesson, "theme": theme, "stance": info.get("stance", "neutral"),
+              "user": user, "event": proposal[:80], "ts": msg_ts}
+    try:
+        _append_memory(_SIG_PREFIX + json.dumps(signal, ensure_ascii=False))
+        _invalidate_memory()
+    except Exception:
+        log.exception("could not write learning signal")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                text="Thanks — I heard you, but couldn't save it just now.")
+        return
+
+    signals, guidelines = load_memory()
+    same = [s for s in signals if s.get("theme") == theme]
+    n = len(same)
+    existing = next((g for g in guidelines
+                     if g.get("theme") == theme and g.get("active", True)), None)
+
+    guide, promoted = None, False
+    if n >= LEARN_THRESHOLD and not existing:
+        guide = _distill_guideline(theme, same)
+        if guide:
+            _append_memory(_GUIDE_PREFIX + json.dumps(
+                {"theme": theme, "guideline": guide, "support": n, "active": True},
+                ensure_ascii=False))
+            _invalidate_memory()
+            promoted = True
+    elif existing:
+        try:                                      # keep the support count fresh
+            payload = {"theme": theme, "guideline": existing.get("guideline"),
+                       "support": n, "active": True}
+            notion.blocks.update(block_id=existing["_bid"], paragraph={"rich_text": [
+                {"type": "text", "text": {"content": (_GUIDE_PREFIX + json.dumps(
+                    payload, ensure_ascii=False))[:1900]}}]})
+            _invalidate_memory()
+        except Exception:
+            log.exception("could not update guideline support")
+
+    if promoted:
+        ack = (f"Got it — that's a consistent pattern now ({n} similar notes), so I've folded it "
+               f"into how I assess going forward:\n> {guide}")
+    elif existing:
+        ack = (f"Noted :+1: — that reinforces a standard I already apply: "
+               f"“{existing.get('guideline')}”.")
+    else:
+        left = max(1, LEARN_THRESHOLD - n)
+        ack = (f"Noted :+1: — logged this. I won't reweight my scoring off a single comment; if "
+               f"the same point comes up ~{left} more time(s), I'll bake it into my standard.")
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=ack)
+    log.info("learning signal on '%s' (%d/%d)%s from %s",
+             theme, n, LEARN_THRESHOLD, " -> promoted" if promoted else "", user)
+
+
+def _is_assessment_thread(client, channel, thread_ts):
+    """True if this thread is one where the bot posted an assessment."""
+    if channel != CHANNEL:
+        return False
+    if (channel, thread_ts) in _assessment_threads:
+        return True
+    try:
+        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)["messages"]
+    except Exception:
+        return False
+    found = any((m.get("bot_id") or m.get("user") == BOT_USER_ID)
+                and ASSESS_SENTINEL in (m.get("text") or "") for m in msgs)
+    if found:
+        _assessment_threads.add((channel, thread_ts))
+    return found
 
 
 def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False):
@@ -1856,6 +2086,9 @@ def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
     """Handle a reply in any thread the bot is part of — a rundown, a prior
     conversation, or any thread where Event-Bot has posted — even without an
     @mention. Recognizes the thread from memory, or by reading it (restart-safe)."""
+    if _is_assessment_thread(client, channel, thread_ts):
+        handle_assessment_feedback(client, channel, thread_ts, msg_ts, user, text)
+        return
     if (channel, thread_ts) in _bot_threads:
         handle_mention(client, channel, thread_ts, msg_ts, user, text)
         return
@@ -1879,10 +2112,17 @@ def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
 
 @app.event("app_mention")
 def on_app_mention(event, client):
-    """A rep @-mentioned the bot with a rep-assignment change."""
+    """An @-mention: assessment-thread feedback, else a rep-assignment change."""
     root = event.get("thread_ts") or event["ts"]
-    _bg(handle_mention, client, event["channel"], root, event["ts"],
+    _bg(_dispatch_mention, client, event["channel"], root, event["ts"],
         event.get("user"), event.get("text", ""))
+
+
+def _dispatch_mention(client, channel, thread_ts, msg_ts, user, text):
+    if _is_assessment_thread(client, channel, thread_ts):
+        handle_assessment_feedback(client, channel, thread_ts, msg_ts, user, text)
+    else:
+        handle_mention(client, channel, thread_ts, msg_ts, user, text)
 
 
 @app.event("message")
@@ -1921,6 +2161,7 @@ def _post_assessment(client, ts, fields, text):
     a = assess_proposal(fields, text)
     if a and a.get("overall") is not None:
         client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=assessment_text(a))
+        _assessment_threads.add((CHANNEL, ts))    # so thread replies route to learning
         log.info("posted assessment %s (%s) for %s",
                  a.get("overall"), a.get("verdict"), ts)
 
