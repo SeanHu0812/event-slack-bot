@@ -39,8 +39,9 @@ score leans on the others.
 **Triggers.** The bot assesses automatically when it detects a new proposal in the channel.
 Anyone can also react **👀 (`:eyes:`)** on any message to assess it on demand.
 
-**Self-learning.** Reply in an assessment thread (with or without @Event-Bot) to give the bot
-insight — e.g. "score open mixers lower" or "this partner always over-promises." The bot logs
+**Self-learning.** @-mention Event-Bot in an assessment thread to give it insight — e.g.
+"@Event-Bot score open mixers lower" or "@Event-Bot this partner always over-promises."
+Only @-mentioned replies are read (plain thread replies are ignored). The bot logs
 each reply as a *signal* to a Notion memory page. It deliberately **won't change its scoring
 off a single comment**: only once the same theme recurs (default 3 times, `LEARN_THRESHOLD`)
 does it distill those signals into a standing *guideline*, which is then injected into every

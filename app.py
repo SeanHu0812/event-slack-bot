@@ -2110,8 +2110,7 @@ def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
     conversation, or any thread where Event-Bot has posted — even without an
     @mention. Recognizes the thread from memory, or by reading it (restart-safe)."""
     if _is_assessment_thread(client, channel, thread_ts):
-        handle_assessment_feedback(client, channel, thread_ts, msg_ts, user, text)
-        return
+        return          # assessment threads: only @-mentions count as feedback (on_app_mention)
     if (channel, thread_ts) in _bot_threads:
         handle_mention(client, channel, thread_ts, msg_ts, user, text)
         return
