@@ -79,14 +79,11 @@ BOT_USER_ID = None                       # resolved at startup, to ignore our ow
 # --- Auto-assessment of event proposals -------------------------------------
 # When a proposal is posted in #community-team, the bot scores it 1-10 across
 # three aspects: past feedback, business-goal fit, and past revenue.
-# Feedback lives in the "Rho Event Feedback Responses" Notion DB, which holds
-# three inline databases (one per city). The bot's Notion integration must be
-# shared into each of these for the feedback aspect to work.
-FEEDBACK_DB_IDS = {
-    "NYC":    "3a6db9eba4f080919797c52d53d48dba",
-    "SF":     "3a6db9eba4f080f09b3bc807fbfc53c7",
-    "Boston": "b72f0dd8e8494ff49920e5f784484db2",
-}
+# Feedback is read straight from the #events-feedback channel (Tally form
+# submissions) — the source-of-truth superset; the synced Notion DB was lossy.
+# The bot must be a member of this channel (channels:history).
+FEEDBACK_CHANNEL = os.environ.get("FEEDBACK_CHANNEL_ID", "C092PD0RD4L")
+FEEDBACK_HISTORY_PAGES = 4               # ~400 most-recent messages scanned
 ASSESS_SENTINEL = "Event assessment"     # header text; also used to skip re-assessing
 ASSESS_MIN_LEN = 40                      # ignore short chatter; proposals are longer
 ASSESS_EMOJI = "eyes"                    # 👀 — manually trigger an assessment on any message
@@ -1398,71 +1395,87 @@ def _tok(s):
             if len(w) >= 3 and w not in _STOP}
 
 
-def _prop_text(props, name):
-    """Read a Notion property as plain text regardless of its type."""
-    p = props.get(name) or {}
-    t = p.get("type")
-    if t == "title":
-        return _plain(p.get("title"))
-    if t == "rich_text":
-        return _plain(p.get("rich_text"))
-    if t == "select":
-        return (p.get("select") or {}).get("name", "") or ""
-    if t == "number":
-        return "" if p.get("number") is None else str(p.get("number"))
-    return _plain(p.get("rich_text") or p.get("title") or [])
-
-
-_feedback_ds = {}                 # city -> data_source_id (cached)
 _feedback_cache = None
 _feedback_ts = 0.0
 _FEEDBACK_TTL = 600               # 10 min
+# Tally posts each submission as "*label*\nvalue" pairs; capture every pair.
+_TALLY_FIELD_RE = re.compile(r"\*([^*\n]+)\*[ \t]*\n(.*?)(?=\n\*[^*\n]+\*[ \t]*\n|\Z)", re.DOTALL)
 
 
-def _feedback_source_id(city, db_id):
-    if city not in _feedback_ds:
-        db = notion.databases.retrieve(database_id=db_id)
-        _feedback_ds[city] = db["data_sources"][0]["id"]
-    return _feedback_ds[city]
+def _message_fulltext(m):
+    """All human-readable text of a Slack message, incl. attachments/blocks —
+    Tally submissions often carry their content there rather than in `text`."""
+    parts = [m.get("text") or ""]
+    for a in m.get("attachments") or []:
+        parts += [a.get("pretext") or "", a.get("text") or "", a.get("fallback") or ""]
+    for b in m.get("blocks") or []:
+        t = b.get("text")
+        if isinstance(t, dict):
+            parts.append(t.get("text") or "")
+        for f in b.get("fields") or []:
+            if isinstance(f, dict):
+                parts.append(f.get("text") or "")
+    return "\n".join(p for p in parts if p)
+
+
+def _parse_tally(text):
+    """Parse one Tally feedback submission into a compact dict, or None if the
+    message isn't a (real, non-test) submission."""
+    if "New submission" not in text:
+        return None
+    city = ""
+    header = re.search(r"New submission for\s+\*?([^*\n.]+)", text)
+    if header:
+        name = header.group(1).upper()
+        city = "NYC" if "NYC" in name else "SF" if "SF" in name else ""
+    row = {"city": city, "event": "", "partner": "", "date": "",
+           "feedback": "", "leads": "", "right_people": "", "adjust": ""}
+    for label, value in _TALLY_FIELD_RE.findall(text):
+        l, v = label.strip().lower(), value.strip()
+        if l == "event":
+            row["event"] = v
+        elif l.startswith("partner"):
+            row["partner"] = v
+        elif l == "date":
+            row["date"] = v
+        elif "high-quality leads" in l:
+            row["leads"] = v
+        elif "adjust" in l:
+            row["adjust"] = v
+        elif "right people" in l:
+            row["right_people"] = v
+        elif "feedback" in l or l.startswith("what did you think"):
+            row["feedback"] = v
+    if not (row["event"] or row["feedback"]):
+        return None
+    if row["event"].strip().upper().startswith("TEST") or \
+            row["feedback"].strip().upper() == "TEST":
+        return None                                # skip Tally test rows
+    return row
 
 
 def fetch_all_feedback():
-    """All rows from the three city feedback DBs as compact dicts (cached).
-    Degrades to [] if the DBs aren't shared with the integration."""
+    """Recent #events-feedback submissions as compact dicts (cached). Degrades to
+    [] if the bot can't read the channel (not a member / missing scope)."""
     global _feedback_cache, _feedback_ts
     if _feedback_cache is not None and (time.time() - _feedback_ts) < _FEEDBACK_TTL:
         return _feedback_cache
-    rows = []
-    for city, db_id in FEEDBACK_DB_IDS.items():
-        try:
-            dsid = _feedback_source_id(city, db_id)
-            cursor = None
-            while True:
-                kwargs = {"data_source_id": dsid, "page_size": 100}
-                if cursor:
-                    kwargs["start_cursor"] = cursor
-                r = notion.data_sources.query(**kwargs)
-                for pg in r["results"]:
-                    pr = pg["properties"]
-                    rows.append({
-                        "city": city,
-                        "event": _prop_text(pr, "Event") or _prop_text(pr, "Event Name"),
-                        "partner": _prop_text(pr, "Parnter") or _prop_text(pr, "Partner"),
-                        "date": _prop_text(pr, "Date"),
-                        "leads": _prop_text(
-                            pr, "How many high-quality leads did you generate from the event?"),
-                        "right_people": _prop_text(
-                            pr, "Do you feel this partner brought the right people "
-                                "into the room? Why or why not?"),
-                        "feedback": _prop_text(pr, "What feedback do you have about the event?"),
-                        "adjust": _prop_text(
-                            pr, "What could we adjust next time to make this event even stronger?"),
-                    })
-                if not r.get("has_more"):
-                    break
-                cursor = r.get("next_cursor")
-        except Exception:
-            log.warning("could not read %s feedback DB (is it shared with the integration?)", city)
+    rows, cursor = [], None
+    try:
+        for _ in range(FEEDBACK_HISTORY_PAGES):
+            kw = {"channel": FEEDBACK_CHANNEL, "limit": 100}
+            if cursor:
+                kw["cursor"] = cursor
+            r = app.client.conversations_history(**kw)
+            for m in r.get("messages", []):
+                row = _parse_tally(_message_fulltext(m))
+                if row:
+                    rows.append(row)
+            cursor = (r.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        log.exception("could not read #events-feedback (is the bot a member of it?)")
     _feedback_cache, _feedback_ts = rows, time.time()
     return rows
 
@@ -1486,17 +1499,20 @@ def _feedback_block(rows):
         return "No past feedback found for this partner or a similar format."
     out = []
     for r in rows:
-        bits = [f"{r['event']} ({r['city']}, {r['date']})" if r['date'] else
-                f"{r['event']} ({r['city']})"]
-        if r["partner"]:
+        loc = ", ".join(x for x in [r.get("city"), r.get("date")] if x)
+        head = r.get("event") or "(event)"
+        if loc:
+            head = f"{head} ({loc})"
+        bits = [head]
+        if r.get("partner"):
             bits.append(f"partner: {r['partner']}")
-        if r["leads"]:
+        if r.get("leads"):
             bits.append(f"high-quality leads: {r['leads']}")
-        if r["right_people"]:
+        if r.get("right_people"):
             bits.append(f"right people?: {r['right_people']}")
-        if r["feedback"]:
+        if r.get("feedback"):
             bits.append(f"feedback: {r['feedback']}")
-        if r["adjust"]:
+        if r.get("adjust"):
             bits.append(f"adjust next time: {r['adjust']}")
         out.append("- " + " | ".join(bits))
     return "\n".join(out)

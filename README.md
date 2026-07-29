@@ -22,8 +22,10 @@ assessment across three aspects, so approvers have a read before they `:approved
 
 1. **Business-goal fit** — scored against Tarlon's *Event Partner Screening Framework*
    (baked into the prompt; six factors, ICP/audience weighted highest).
-2. **Past feedback** — pulled from the *Rho Event Feedback Responses* Notion DB (NYC / SF /
-   Boston), matched to the proposed partner/format by keyword overlap.
+2. **Past feedback** — read directly from the **#events-feedback** channel (the Tally form
+   submissions), matched to the proposed partner/format by keyword overlap. The channel is
+   the complete source of truth; the synced Notion DB was lossy, so the bot parses the
+   submissions itself (skipping test rows). The bot must be a member of #events-feedback.
 3. **Past revenue** — queried live from **Snowflake** for revenue tied to the partner/format.
    *Not enabled yet* — the assessment currently posts aspects 1–2 only; the revenue row
    appears automatically once Snowflake is configured (see below).
@@ -66,8 +68,8 @@ revenue aspect stays off:
   LIMIT  25
   ```
 
-The feedback aspect needs the three inline feedback DBs shared with the bot's Notion
-integration (same integration as the events calendar).
+The feedback aspect needs the bot invited to **#events-feedback** (`/invite @Event-Bot`);
+it already has `channels:history`. Override the channel with `FEEDBACK_CHANNEL_ID` if needed.
 
 ### Budget warnings (NYC & SF only)
 The bot cross-checks proposal cost against the monthly budget in a Google Sheet
