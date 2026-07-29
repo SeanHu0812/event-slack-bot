@@ -23,6 +23,12 @@ try:
 except ImportError:
     _CALENDAR_AVAILABLE = False
 
+try:
+    import snowflake.connector as snowflake_connector
+    _SNOWFLAKE_AVAILABLE = True
+except ImportError:
+    _SNOWFLAKE_AVAILABLE = False
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("events-bot")
@@ -69,6 +75,20 @@ REPS_REMINDER_SENTINEL = "Reps assignment are missing"
 MY_EVENTS_HORIZON_DAYS = 60              # how far ahead /my-event looks
 ASSIGN_HORIZON_DAYS = 90                 # how far ahead @-mention reassignments can reach
 BOT_USER_ID = None                       # resolved at startup, to ignore our own @mentions
+
+# --- Auto-assessment of event proposals -------------------------------------
+# When a proposal is posted in #community-team, the bot scores it 1-10 across
+# three aspects: past feedback, business-goal fit, and past revenue.
+# Feedback lives in the "Rho Event Feedback Responses" Notion DB, which holds
+# three inline databases (one per city). The bot's Notion integration must be
+# shared into each of these for the feedback aspect to work.
+FEEDBACK_DB_IDS = {
+    "NYC":    "3a6db9eba4f080919797c52d53d48dba",
+    "SF":     "3a6db9eba4f080f09b3bc807fbfc53c7",
+    "Boston": "b72f0dd8e8494ff49920e5f784484db2",
+}
+ASSESS_SENTINEL = "Event assessment"     # header text; also used to skip re-assessing
+ASSESS_MIN_LEN = 40                      # ignore short chatter; proposals are longer
 
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -1315,6 +1335,288 @@ def replacement_prompt(removed, event):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Auto-assessment of event proposals (feedback + business fit + revenue)
+# ---------------------------------------------------------------------------
+
+# Tarlon's "Event Partner Screening Framework", distilled into a scoring rubric.
+# Refresh this if the source doc changes:
+# https://docs.google.com/document/d/1lxKg9V8rw2ibVa-gOcHeI9h4kCJgaFfAEc3sor8jbV4
+BUSINESS_FRAMEWORK = """\
+Rho Event Partner Screening Framework (how we decide if an event is worth it).
+
+Philosophy: fewer, higher-quality events with intentional partners beat volume.
+We lean toward thought leadership, panels, curated dinners, and real conversations
+over loud, open, high-volume parties. The core question every screen answers:
+"Does this put the right founders in the room with Rho, in a setting that reflects
+well on us?" When in doubt, pass.
+
+The bar:
+- ICP: pre-seed -> Series A founders, ideally in SF, NYC, Boston, or LA.
+- Ideal model: a VC/accelerator partner fills the room -> a service partner sponsors.
+- Budget: $1-3K smaller events, $5-10K flagship activations.
+- Lean toward: curated dinners, panels, thought leadership, intimate mixers.
+- Avoid: open/unvetted RSVPs, gimmick formats, doubling up on the same service-partner category.
+- Auto-pass: wrong-ICP audience, or unprofessional/blacklisted behavior in planning.
+
+Score each of the six factors Green (strong) / Flag (caution) / Fail (dealbreaker):
+1. Audience & ICP fit (MOST IMPORTANT): pre-seed->Series A founders in core markets,
+   curated & vetted. Fail if broad/junior/wrong-geo or open unvetted RSVPs.
+2. Room-fill credibility: partner owns their list and can fill the room. Fail if the
+   partner expects Rho to do all the attendance heavy lifting.
+3. Format & vibe fit: intimate dinners, curated mixers, panels, thought leadership.
+   Dinners (~$2-4K) consistently beat large mixers per activation. Fail on poker
+   nights, workout classes, gimmicks, or open-RSVP mixers with no curation.
+4. Partner behavior: professional, relationship-first. Flag transactional/intel-fishing
+   tone; fail/blacklist unprofessional conduct or last-minute drop-outs.
+5. Budget & sponsorship structure: ask proportionate to audience quality; partner
+   co-sponsors. Flag a high ask only justifiable if turnout is strong. Watch category
+   doubling (two law firms, two accounting firms in one room).
+6. Track record & ROI path: proven execution, clear turnout numbers, a follow-up system
+   to convert the room. Fail on a history of low turnout or a big-format ask with no
+   follow-up mechanism.
+
+Verdict: GO (clears the bar), FLAG (proceed only with fixes/conditions), or PASS.
+"""
+
+_STOP = {"the", "a", "an", "and", "or", "of", "for", "with", "to", "in", "at", "on",
+         "by", "hosted", "event", "dinner", "founder", "founders", "rho", "vc", "night"}
+
+
+def _tok(s):
+    """Lowercase alnum tokens (>=3 chars), minus common event stopwords."""
+    return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if len(w) >= 3 and w not in _STOP}
+
+
+def _prop_text(props, name):
+    """Read a Notion property as plain text regardless of its type."""
+    p = props.get(name) or {}
+    t = p.get("type")
+    if t == "title":
+        return _plain(p.get("title"))
+    if t == "rich_text":
+        return _plain(p.get("rich_text"))
+    if t == "select":
+        return (p.get("select") or {}).get("name", "") or ""
+    if t == "number":
+        return "" if p.get("number") is None else str(p.get("number"))
+    return _plain(p.get("rich_text") or p.get("title") or [])
+
+
+_feedback_ds = {}                 # city -> data_source_id (cached)
+_feedback_cache = None
+_feedback_ts = 0.0
+_FEEDBACK_TTL = 600               # 10 min
+
+
+def _feedback_source_id(city, db_id):
+    if city not in _feedback_ds:
+        db = notion.databases.retrieve(database_id=db_id)
+        _feedback_ds[city] = db["data_sources"][0]["id"]
+    return _feedback_ds[city]
+
+
+def fetch_all_feedback():
+    """All rows from the three city feedback DBs as compact dicts (cached).
+    Degrades to [] if the DBs aren't shared with the integration."""
+    global _feedback_cache, _feedback_ts
+    if _feedback_cache is not None and (time.time() - _feedback_ts) < _FEEDBACK_TTL:
+        return _feedback_cache
+    rows = []
+    for city, db_id in FEEDBACK_DB_IDS.items():
+        try:
+            dsid = _feedback_source_id(city, db_id)
+            cursor = None
+            while True:
+                kwargs = {"data_source_id": dsid, "page_size": 100}
+                if cursor:
+                    kwargs["start_cursor"] = cursor
+                r = notion.data_sources.query(**kwargs)
+                for pg in r["results"]:
+                    pr = pg["properties"]
+                    rows.append({
+                        "city": city,
+                        "event": _prop_text(pr, "Event") or _prop_text(pr, "Event Name"),
+                        "partner": _prop_text(pr, "Parnter") or _prop_text(pr, "Partner"),
+                        "date": _prop_text(pr, "Date"),
+                        "leads": _prop_text(
+                            pr, "How many high-quality leads did you generate from the event?"),
+                        "right_people": _prop_text(
+                            pr, "Do you feel this partner brought the right people "
+                                "into the room? Why or why not?"),
+                        "feedback": _prop_text(pr, "What feedback do you have about the event?"),
+                        "adjust": _prop_text(
+                            pr, "What could we adjust next time to make this event even stronger?"),
+                    })
+                if not r.get("has_more"):
+                    break
+                cursor = r.get("next_cursor")
+        except Exception:
+            log.warning("could not read %s feedback DB (is it shared with the integration?)", city)
+    _feedback_cache, _feedback_ts = rows, time.time()
+    return rows
+
+
+def relevant_feedback(partner, event_name, limit=8):
+    """Feedback rows most similar to this partner/format, by token overlap."""
+    terms = _tok(partner) | _tok(event_name)
+    if not terms:
+        return []
+    scored = []
+    for r in fetch_all_feedback():
+        overlap = len(terms & (_tok(r["partner"]) | _tok(r["event"])))
+        if overlap:
+            scored.append((overlap, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
+
+
+def _feedback_block(rows):
+    if not rows:
+        return "No past feedback found for this partner or a similar format."
+    out = []
+    for r in rows:
+        bits = [f"{r['event']} ({r['city']}, {r['date']})" if r['date'] else
+                f"{r['event']} ({r['city']})"]
+        if r["partner"]:
+            bits.append(f"partner: {r['partner']}")
+        if r["leads"]:
+            bits.append(f"high-quality leads: {r['leads']}")
+        if r["right_people"]:
+            bits.append(f"right people?: {r['right_people']}")
+        if r["feedback"]:
+            bits.append(f"feedback: {r['feedback']}")
+        if r["adjust"]:
+            bits.append(f"adjust next time: {r['adjust']}")
+        out.append("- " + " | ".join(bits))
+    return "\n".join(out)
+
+
+_revenue_cache = {}               # term -> (text, timestamp)
+_REVENUE_TTL = 900
+
+
+def snowflake_revenue(partner, event_type, city, event_name):
+    """Past revenue tied to this partner/format, from Snowflake. Fully driven by
+    env: the SNOWFLAKE_* connection vars plus REVENUE_SQL, a SELECT that uses the
+    named binds %(partner)s %(event_type)s %(city)s %(term)s. Returns a short text
+    summary of the rows, or None when revenue isn't configured / is unavailable."""
+    sql = os.environ.get("REVENUE_SQL")
+    if not (_SNOWFLAKE_AVAILABLE and sql and os.environ.get("SNOWFLAKE_ACCOUNT")):
+        return None
+    term = (partner or event_name or "").strip()
+    cached = _revenue_cache.get(term)
+    if cached and (time.time() - cached[1]) < _REVENUE_TTL:
+        return cached[0]
+    binds = {"partner": partner or "", "event_type": event_type or "",
+             "city": city or "", "term": term}
+    try:
+        conn = snowflake_connector.connect(
+            account=os.environ["SNOWFLAKE_ACCOUNT"],
+            user=os.environ["SNOWFLAKE_USER"],
+            password=os.environ.get("SNOWFLAKE_PASSWORD"),
+            authenticator=os.environ.get("SNOWFLAKE_AUTHENTICATOR"),
+            warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE"),
+            database=os.environ.get("SNOWFLAKE_DATABASE"),
+            schema=os.environ.get("SNOWFLAKE_SCHEMA"),
+            role=os.environ.get("SNOWFLAKE_ROLE"),
+            login_timeout=15, network_timeout=30)
+    except Exception:
+        log.exception("snowflake connection failed")
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, binds)
+        cols = [c[0] for c in cur.description]
+        rows = cur.fetchmany(25)
+    except Exception:
+        log.exception("snowflake revenue query failed")
+        return None
+    finally:
+        conn.close()
+    if not rows:
+        text = "No comparable past revenue found in Snowflake."
+    else:
+        text = "\n".join(", ".join(f"{c}={v}" for c, v in zip(cols, row)) for row in rows)
+    _revenue_cache[term] = (text, time.time())
+    return text
+
+
+def assess_proposal(fields, text):
+    """Score a proposal 1-10 across feedback / business-fit / revenue. Returns the
+    parsed JSON assessment, or {} on failure."""
+    partner = fields.get("partner") or ""
+    event_name = fields.get("event") or ""
+    city = fields.get("city") or ""
+    fb = _feedback_block(relevant_feedback(partner, event_name))
+    rev = snowflake_revenue(partner, None, city, event_name)
+    rev_block = rev if rev is not None else "Revenue data source not configured."
+    cost = fields.get("cost")
+    prompt = (
+        "You are assessing whether Rho should invest in a proposed community event. "
+        "Score it 1-10 across THREE aspects and give a short reason for each. Base your "
+        "judgement ONLY on the material below; never invent history or numbers.\n\n"
+        "=== BUSINESS-GOAL FRAMEWORK ===\n" + BUSINESS_FRAMEWORK + "\n"
+        "=== PAST FEEDBACK (from prior events with this partner or similar formats) ===\n"
+        + fb + "\n\n"
+        "=== PAST REVENUE (from Snowflake, tied to this partner/format) ===\n"
+        + rev_block + "\n\n"
+        "=== THE PROPOSAL ===\n"
+        f"Event: {event_name}\nPartner: {partner or 'unknown'}\nCity: {city or 'unknown'}\n"
+        f"Estimated cost: {cost if cost is not None else 'unknown'}\n"
+        f"Full message:\n{text}\n\n"
+        "Scoring rules:\n"
+        "- business.score: how well it fits the framework above (this is the primary driver; "
+        "weight audience/ICP fit most heavily).\n"
+        "- feedback.score: what prior feedback implies about this partner/format. If there is "
+        "NO relevant feedback, set feedback.score to null and say so — do not penalize.\n"
+        "- revenue.score: what past revenue implies. If revenue is 'not configured' or shows no "
+        "comparable events, set revenue.score to null and say so — do not penalize.\n"
+        "- overall: a 1-10 holistic score, driven mainly by business fit and adjusted by whatever "
+        "evidence exists in feedback/revenue. Do NOT average in nulls.\n"
+        "- verdict: exactly one of GO, FLAG, or PASS.\n\n"
+        "Return ONLY JSON: {\"overall\": int, \"verdict\": \"GO|FLAG|PASS\", "
+        "\"business\": {\"score\": int, \"reason\": str}, "
+        "\"feedback\": {\"score\": int|null, \"reason\": str}, "
+        "\"revenue\": {\"score\": int|null, \"reason\": str}, "
+        "\"summary\": str}. Keep every reason to one sentence; summary to one sentence."
+    )
+    return ask_json(prompt, max_tokens=1200) or {}
+
+
+def _score_str(s):
+    return f"{s}/10" if isinstance(s, (int, float)) else "n/a"
+
+
+def assessment_text(a):
+    verdict = (a.get("verdict") or "").upper()
+    emoji = {"GO": ":large_green_circle:", "FLAG": ":large_yellow_circle:",
+             "PASS": ":red_circle:"}.get(verdict, ":white_circle:")
+    b = a.get("business") or {}
+    f = a.get("feedback") or {}
+    r = a.get("revenue") or {}
+    lines = [
+        f"*{ASSESS_SENTINEL}* {emoji} *{verdict or '—'}* · *{_score_str(a.get('overall'))}*",
+        f"> *Business fit* ({_score_str(b.get('score'))}): {b.get('reason', '—')}",
+        f"> *Past feedback* ({_score_str(f.get('score'))}): {f.get('reason', '—')}",
+        f"> *Past revenue* ({_score_str(r.get('score'))}): {r.get('reason', '—')}",
+    ]
+    if a.get("summary"):
+        lines += ["", a["summary"]]
+    return "\n".join(lines)
+
+
+def already_assessed(client, ts):
+    """True if the bot has already posted an assessment in this proposal's thread."""
+    try:
+        msgs = client.conversations_replies(channel=CHANNEL, ts=ts, limit=50)["messages"]
+    except Exception:
+        return False
+    return any((m.get("bot_id") or m.get("user") == BOT_USER_ID)
+               and ASSESS_SENTINEL in (m.get("text") or "") for m in msgs)
+
+
 def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
@@ -1578,23 +1880,41 @@ def on_message(event, client):
     if thread_ts:
         _bg(handle_thread_reply, client, channel, thread_ts, ts, user, text)
         return
-    # Top-level community-channel message — proposal budget heads-up.
+    # Top-level community-channel message — proposal heads-up + assessment.
     if channel != CHANNEL:
         return
-    if len(text) < 20:                            # skip chatter
+    if len(text) < ASSESS_MIN_LEN:                # skip chatter
         return
-    _bg(_pre_approval_check, client, ts, text)
+    _bg(_handle_new_proposal, client, ts, text)
 
 
-def _pre_approval_check(client, ts, text):
+def _handle_new_proposal(client, ts, text):
+    """A top-level #community-team message. Parse once; if it's a proposal, post a
+    budget heads-up (when over threshold) and a 1-10 assessment in its thread."""
     fields = parse_proposal(text)
-    if not fields.get("event") or not fields.get("date"):
+    if not fields.get("event"):
         return
-    status = budget_status(fields)
-    if not status:
-        return
-    client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=pre_approval_text(status))
-    log.info("posted pre-approval %s warning for %s", status["band"], ts)
+    # Budget heads-up (needs a date to look up the month's budget).
+    if fields.get("date"):
+        try:
+            status = budget_status(fields)
+            if status:
+                client.chat_postMessage(channel=CHANNEL, thread_ts=ts,
+                                        text=pre_approval_text(status))
+                log.info("posted pre-approval %s warning for %s", status["band"], ts)
+        except Exception:
+            log.exception("budget heads-up failed for %s", ts)
+    # Three-aspect assessment (idempotent per thread).
+    try:
+        if already_assessed(client, ts):
+            return
+        a = assess_proposal(fields, text)
+        if a and a.get("overall") is not None:
+            client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=assessment_text(a))
+            log.info("posted assessment %s (%s) for %s",
+                     a.get("overall"), a.get("verdict"), ts)
+    except Exception:
+        log.exception("assessment failed for %s", ts)
 
 
 @app.command("/check-budget")

@@ -16,6 +16,43 @@ No DMs, no other output.
 4. Parses the free-text proposal into clean JSON with one Anthropic call.
 5. Creates the Notion page (title + date + city/partner/cost/invite link + dedup marker).
 
+### Proposal auto-assessment (1–10 score)
+When a proposal is posted in #community-team, the bot replies in-thread with a 1–10
+assessment across three aspects, so approvers have a read before they `:approved:`:
+
+1. **Business-goal fit** — scored against Tarlon's *Event Partner Screening Framework*
+   (baked into the prompt; six factors, ICP/audience weighted highest).
+2. **Past feedback** — pulled from the *Rho Event Feedback Responses* Notion DB (NYC / SF /
+   Boston), matched to the proposed partner/format by keyword overlap.
+3. **Past revenue** — queried live from **Snowflake** for revenue tied to the partner/format.
+
+The message shows an overall score + GO/FLAG/PASS verdict and a one-sentence reason per
+aspect. Aspects with no data score `n/a` (never penalized). It's idempotent — one
+assessment per proposal thread. Each aspect degrades gracefully: if the feedback DBs aren't
+shared with the integration, or Snowflake isn't configured, that aspect is skipped and the
+score leans on the others.
+
+**Snowflake config (revenue aspect).** Set these as Replit secrets; without them the
+revenue aspect is skipped:
+
+- `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, and either `SNOWFLAKE_PASSWORD` or
+  `SNOWFLAKE_AUTHENTICATOR` (e.g. `SNOWFLAKE_JWT` with a key-pair).
+- `SNOWFLAKE_WAREHOUSE`, `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, `SNOWFLAKE_ROLE`.
+- `REVENUE_SQL` — a `SELECT` using named binds `%(partner)s`, `%(event_type)s`,
+  `%(city)s`, `%(term)s`. Returned rows (first 25) are summarized and handed to the model.
+  Example (mirrors the Salesforce Opportunity event tagging):
+
+  ```sql
+  SELECT EVENT__C, STAGE_NAME, ORIGINATION_TOTAL_COMMITTED_DEPOSITS__C
+  FROM   ANALYTICS.SALESFORCE.OPPORTUNITY
+  WHERE  EVENT__C ILIKE '%' || %(term)s || '%'
+  ORDER  BY CLOSE_DATE DESC
+  LIMIT  25
+  ```
+
+The feedback aspect needs the three inline feedback DBs shared with the bot's Notion
+integration (same integration as the events calendar).
+
 ### Budget warnings (NYC & SF only)
 The bot cross-checks proposal cost against the monthly budget in a Google Sheet
 (`Cost Analysis Per Month` table on the NYC and SF tabs; `Monthly Budget` cap per tab).
