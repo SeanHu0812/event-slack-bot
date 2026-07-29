@@ -97,11 +97,15 @@ def to_number(v):
         return None
 
 
-def ask_json(prompt, max_tokens=700):
+PARSE_MODEL = "claude-sonnet-5"                  # accurate default
+FAST_MODEL = "claude-haiku-4-5-20251001"         # faster/cheaper for the change parse
+
+
+def ask_json(prompt, max_tokens=700, model=PARSE_MODEL):
     """Call Claude and parse its reply as JSON. Returns {} on failure. Skips any
     non-text (e.g. extended-thinking) blocks and strips code fences."""
     out = claude.messages.create(
-        model="claude-sonnet-5", max_tokens=max_tokens,
+        model=model, max_tokens=max_tokens,
         system="You output only valid JSON. No prose, no markdown fences.",
         messages=[{"role": "user", "content": prompt}])
     raw = "".join(b.text for b in out.content if b.type == "text").strip()
@@ -183,6 +187,7 @@ def create_notion_page(f, ts):
     page = notion.pages.create(
         parent={"type": "data_source_id", "data_source_id": data_source_id()},
         properties=props)
+    invalidate_week_cache()
     return page["url"]
 
 
@@ -511,8 +516,23 @@ def _plain(rich):
     return "".join(t.get("plain_text", "") for t in (rich or []))
 
 
+_week_cache = None                               # (fetched_monotonic, events)
+_WEEK_TTL = 20                                   # short: dedupes repeated reads within one action
+
+
+def invalidate_week_cache():
+    """Drop the this-week events cache — call right after any Notion write so the
+    next read reflects the change (e.g. the rundown edit after a rep change)."""
+    global _week_cache
+    _week_cache = None
+
+
 def fetch_week_events():
-    """This week's NYC events (HOLD placeholders excluded), sorted by date."""
+    """This week's NYC events (HOLD placeholders excluded), sorted by date.
+    Cached briefly so a single change doesn't re-query Notion 2-3 times."""
+    global _week_cache
+    if _week_cache and time.monotonic() - _week_cache[0] < _WEEK_TTL:
+        return _week_cache[1]
     start, end = week_range()
     r = notion.data_sources.query(
         data_source_id=data_source_id(),
@@ -540,6 +560,7 @@ def fetch_week_events():
             "url": page["url"],
         })
     events.sort(key=lambda e: e["date"])
+    _week_cache = (time.monotonic(), events)
     return events
 
 
@@ -1204,7 +1225,7 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         + "\n".join(lines) + f"\n\n{convo}LATEST MESSAGE:\n{text}"
     )
     # Generous budget: answers can list many events across multiple matching reps.
-    return ask_json(prompt, max_tokens=2000)
+    return ask_json(prompt, max_tokens=2000, model=FAST_MODEL)
 
 
 def active_reps_this_week():
@@ -1256,18 +1277,21 @@ def event_window(event):
     return (s, e) if s and e else None
 
 
-def reps_available_for(event, exclude=(), window=None):
-    """Active reps free for this event: by real Google free/busy at the event's time
-    when a time is known, else 'not already booked that day' from Notion."""
+def reps_available_for(event, exclude=(), window=None, use_calendar=True):
+    """Active reps free for this event. With use_calendar, checks real Google
+    free/busy at the event's time (used by /reps-availability, on demand). Without
+    it, the fast Notion 'not already booked that day' rule (used inline on a change,
+    to keep the response snappy)."""
     excl = {r.strip().lower() for r in exclude}
     pool = [r for r in active_reps_this_week() if r.strip().lower() not in excl]
-    if window is None:
-        window = event_window(event)
-    if window:
-        emails = rep_emails()
-        pool_email = {r: emails.get(r.strip().lower()) for r in pool}
-        busy = calendar_busy([e for e in pool_email.values() if e], window[0], window[1])
-        return [r for r in pool if (pool_email[r] or "").strip().lower() not in busy]
+    if use_calendar:
+        if window is None:
+            window = event_window(event)
+        if window:
+            emails = rep_emails()
+            pool_email = {r: emails.get(r.strip().lower()) for r in pool}
+            busy = calendar_busy([e for e in pool_email.values() if e], window[0], window[1])
+            return [r for r in pool if (pool_email[r] or "").strip().lower() not in busy]
     busyday = {r.strip().lower() for e in fetch_week_events()
                if e["date"] == event["date"] for r in e["reps"]}
     return [r for r in pool if r.strip().lower() not in busyday]
@@ -1281,7 +1305,7 @@ def replacement_prompt(removed, event):
         head = f"Who will be taking {poss} place?"
     else:
         head = "Who will be taking their place?"
-    avail = reps_available_for(event, exclude=removed)
+    avail = reps_available_for(event, exclude=removed, use_calendar=False)   # inline: keep it fast
     lines = [head]
     if avail:
         lines.append("The reps available that day are:")
@@ -1349,51 +1373,48 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
 
     notion.pages.update(page_id=ev["id"],
                         properties={"Reps": {"multi_select": [{"name": n} for n in new]}})
+    invalidate_week_cache()                        # so the deferred rundown edit reflects this
     log.info("assignment change on %r by %s: -%s +%s", ev["event"], user, removed, add)
+
+    needs_replacement = bool(removed) and not add  # dropped with no named replacement
+
+    # --- User-facing response FIRST (keep it snappy) ---
+    if is_rundown:
+        edit_rundowns(client)                      # the rundown edit is the feedback here
+        if needs_replacement:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                    text=replacement_prompt(removed, ev))
+    else:
+        # @mention / DM: a plain-text confirmation — no @-mentions, no pings.
+        parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
+        if removed:
+            parts.append("Removed: " + ", ".join(removed))
+        if add:
+            parts.append("Added: " + ", ".join(add))
+        if needs_replacement:
+            parts.append("")
+            parts.append(replacement_prompt(removed, ev))
+        else:
+            parts.append("Reps now: " + (", ".join(new) or "none"))
+        if invalid:
+            parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
+
+    # --- Slower side-effects AFTER the response (user isn't blocked on these) ---
     try:
         update_calendar_guests(ev["id"], new)      # keep the gcal invite in sync (no email)
     except Exception:
         log.exception("calendar guest sync failed for %s", ev["id"])
-
-    # Always keep the weekly rundown message current — edit in place, no new message —
-    # regardless of how the change came in (reply, @mention, or DM).
-    try:
-        edit_rundowns(client)
-    except Exception:
-        log.exception("rundown refresh failed")
-
-    # DM each newly-assigned rep their event's lead list, if one exists.
-    for r in add:
+    if not is_rundown:                             # rundown path already edited above
+        try:
+            edit_rundowns(client)
+        except Exception:
+            log.exception("rundown refresh failed")
+    for r in add:                                  # DM newly-assigned reps their lead list
         try:
             send_lead_list(client, r, ev["event"], ev.get("invite"))
         except Exception:
             log.exception("lead-list send failed for %s", r)
-
-    # A removal with no named replacement -> ask who's covering, listing free reps.
-    needs_replacement = bool(removed) and not add
-
-    # A reply in the rundown thread needs no extra message; the edit is the feedback —
-    # unless we still need to ask for a replacement, which is a required follow-up.
-    if is_rundown:
-        if needs_replacement:
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                    text=replacement_prompt(removed, ev))
-        return
-
-    # Otherwise (@mention / DM): a plain-text confirmation — no @-mentions, no pings.
-    parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
-    if removed:
-        parts.append("Removed: " + ", ".join(removed))
-    if add:
-        parts.append("Added: " + ", ".join(add))
-    if needs_replacement:
-        parts.append("")
-        parts.append(replacement_prompt(removed, ev))
-    else:
-        parts.append("Reps now: " + (", ".join(new) or "none"))
-    if invalid:
-        parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
-    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
 
 
 # ---------------------------------------------------------------------------
