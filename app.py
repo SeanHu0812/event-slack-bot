@@ -89,6 +89,7 @@ FEEDBACK_DB_IDS = {
 }
 ASSESS_SENTINEL = "Event assessment"     # header text; also used to skip re-assessing
 ASSESS_MIN_LEN = 40                      # ignore short chatter; proposals are longer
+ASSESS_EMOJI = "eyes"                    # 👀 — manually trigger an assessment on any message
 
 app    = App(token=os.environ["SLACK_BOT_TOKEN"])
 notion = Client(auth=os.environ["NOTION_TOKEN"])
@@ -1543,25 +1544,43 @@ def snowflake_revenue(partner, event_type, city, event_name):
     return text
 
 
+def revenue_configured():
+    """True when the Snowflake revenue aspect is wired up (lib + creds + query)."""
+    return bool(_SNOWFLAKE_AVAILABLE and os.environ.get("SNOWFLAKE_ACCOUNT")
+                and os.environ.get("REVENUE_SQL"))
+
+
 def assess_proposal(fields, text):
-    """Score a proposal 1-10 across feedback / business-fit / revenue. Returns the
-    parsed JSON assessment, or {} on failure."""
+    """Score a proposal 1-10 across business-fit + feedback (+ revenue when Snowflake
+    is configured). Returns the parsed JSON assessment, or {} on failure."""
     partner = fields.get("partner") or ""
     event_name = fields.get("event") or ""
     city = fields.get("city") or ""
-    fb = _feedback_block(relevant_feedback(partner, event_name))
-    rev = snowflake_revenue(partner, None, city, event_name)
-    rev_block = rev if rev is not None else "Revenue data source not configured."
     cost = fields.get("cost")
+    fb = _feedback_block(relevant_feedback(partner, event_name))
+    rev_enabled = revenue_configured()
+
+    aspects = "THREE" if rev_enabled else "TWO"
+    revenue_section = ""
+    revenue_rule = ""
+    revenue_json = ""
+    if rev_enabled:
+        rev = snowflake_revenue(partner, None, city, event_name)
+        rev_block = rev if rev is not None else "No comparable past revenue found."
+        revenue_section = ("=== PAST REVENUE (from Snowflake, tied to this partner/format) ===\n"
+                           + rev_block + "\n\n")
+        revenue_rule = ("- revenue.score: what past revenue implies. If it shows no comparable "
+                        "events, set revenue.score to null and say so — do not penalize.\n")
+        revenue_json = "\"revenue\": {\"score\": int|null, \"reason\": str}, "
+
     prompt = (
         "You are assessing whether Rho should invest in a proposed community event. "
-        "Score it 1-10 across THREE aspects and give a short reason for each. Base your "
+        f"Score it 1-10 across {aspects} aspects and give a short reason for each. Base your "
         "judgement ONLY on the material below; never invent history or numbers.\n\n"
         "=== BUSINESS-GOAL FRAMEWORK ===\n" + BUSINESS_FRAMEWORK + "\n"
         "=== PAST FEEDBACK (from prior events with this partner or similar formats) ===\n"
         + fb + "\n\n"
-        "=== PAST REVENUE (from Snowflake, tied to this partner/format) ===\n"
-        + rev_block + "\n\n"
+        + revenue_section +
         "=== THE PROPOSAL ===\n"
         f"Event: {event_name}\nPartner: {partner or 'unknown'}\nCity: {city or 'unknown'}\n"
         f"Estimated cost: {cost if cost is not None else 'unknown'}\n"
@@ -1571,18 +1590,20 @@ def assess_proposal(fields, text):
         "weight audience/ICP fit most heavily).\n"
         "- feedback.score: what prior feedback implies about this partner/format. If there is "
         "NO relevant feedback, set feedback.score to null and say so — do not penalize.\n"
-        "- revenue.score: what past revenue implies. If revenue is 'not configured' or shows no "
-        "comparable events, set revenue.score to null and say so — do not penalize.\n"
+        + revenue_rule +
         "- overall: a 1-10 holistic score, driven mainly by business fit and adjusted by whatever "
-        "evidence exists in feedback/revenue. Do NOT average in nulls.\n"
+        "evidence exists. Do NOT average in nulls.\n"
         "- verdict: exactly one of GO, FLAG, or PASS.\n\n"
         "Return ONLY JSON: {\"overall\": int, \"verdict\": \"GO|FLAG|PASS\", "
         "\"business\": {\"score\": int, \"reason\": str}, "
         "\"feedback\": {\"score\": int|null, \"reason\": str}, "
-        "\"revenue\": {\"score\": int|null, \"reason\": str}, "
+        + revenue_json +
         "\"summary\": str}. Keep every reason to one sentence; summary to one sentence."
     )
-    return ask_json(prompt, max_tokens=1200) or {}
+    a = ask_json(prompt, max_tokens=1200) or {}
+    if a:
+        a["_revenue_enabled"] = rev_enabled
+    return a
 
 
 def _score_str(s):
@@ -1595,13 +1616,14 @@ def assessment_text(a):
              "PASS": ":red_circle:"}.get(verdict, ":white_circle:")
     b = a.get("business") or {}
     f = a.get("feedback") or {}
-    r = a.get("revenue") or {}
     lines = [
         f"*{ASSESS_SENTINEL}* {emoji} *{verdict or '—'}* · *{_score_str(a.get('overall'))}*",
         f"> *Business fit* ({_score_str(b.get('score'))}): {b.get('reason', '—')}",
         f"> *Past feedback* ({_score_str(f.get('score'))}): {f.get('reason', '—')}",
-        f"> *Past revenue* ({_score_str(r.get('score'))}): {r.get('reason', '—')}",
     ]
+    if a.get("_revenue_enabled"):
+        r = a.get("revenue") or {}
+        lines.append(f"> *Past revenue* ({_score_str(r.get('score'))}): {r.get('reason', '—')}")
     if a.get("summary"):
         lines += ["", a["summary"]]
     return "\n".join(lines)
@@ -1817,6 +1839,10 @@ def on_reaction(event, client):
     if reaction == DONE_EMOJI and user == DREW_ID:
         _bg(handle_reps_done, client, channel, ts)
         return
+    # 👀 on any #community-team message manually triggers an assessment.
+    if reaction == ASSESS_EMOJI and channel == CHANNEL:
+        _bg(_assess_message, client, ts)
+        return
     # Event approvals / over-budget confirmations in #community-team.
     if channel != CHANNEL or user not in APPROVERS:
         return
@@ -1888,6 +1914,17 @@ def on_message(event, client):
     _bg(_handle_new_proposal, client, ts, text)
 
 
+def _post_assessment(client, ts, fields, text):
+    """Assess a proposal and post it in-thread, unless one is already there."""
+    if already_assessed(client, ts):
+        return
+    a = assess_proposal(fields, text)
+    if a and a.get("overall") is not None:
+        client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=assessment_text(a))
+        log.info("posted assessment %s (%s) for %s",
+                 a.get("overall"), a.get("verdict"), ts)
+
+
 def _handle_new_proposal(client, ts, text):
     """A top-level #community-team message. Parse once; if it's a proposal, post a
     budget heads-up (when over threshold) and a 1-10 assessment in its thread."""
@@ -1904,17 +1941,33 @@ def _handle_new_proposal(client, ts, text):
                 log.info("posted pre-approval %s warning for %s", status["band"], ts)
         except Exception:
             log.exception("budget heads-up failed for %s", ts)
-    # Three-aspect assessment (idempotent per thread).
     try:
-        if already_assessed(client, ts):
-            return
-        a = assess_proposal(fields, text)
-        if a and a.get("overall") is not None:
-            client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=assessment_text(a))
-            log.info("posted assessment %s (%s) for %s",
-                     a.get("overall"), a.get("verdict"), ts)
+        _post_assessment(client, ts, fields, text)
     except Exception:
         log.exception("assessment failed for %s", ts)
+
+
+def _assess_message(client, ts):
+    """Manual 👀 trigger: fetch the reacted message and assess it if it's a proposal."""
+    if already_assessed(client, ts):
+        return
+    try:
+        msgs = client.conversations_history(
+            channel=CHANNEL, latest=ts, inclusive=True, limit=1).get("messages", [])
+    except Exception:
+        log.exception("could not fetch reacted message %s", ts)
+        return
+    text = (msgs[0].get("text") if msgs else "") or ""
+    if not text:
+        return
+    fields = parse_proposal(text)
+    if not fields.get("event"):
+        log.info("👀 on %s but it isn't an event proposal; skipping", ts)
+        return
+    try:
+        _post_assessment(client, ts, fields, text)
+    except Exception:
+        log.exception("manual assessment failed for %s", ts)
 
 
 @app.command("/check-budget")

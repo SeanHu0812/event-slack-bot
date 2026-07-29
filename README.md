@@ -25,6 +25,8 @@ assessment across three aspects, so approvers have a read before they `:approved
 2. **Past feedback** — pulled from the *Rho Event Feedback Responses* Notion DB (NYC / SF /
    Boston), matched to the proposed partner/format by keyword overlap.
 3. **Past revenue** — queried live from **Snowflake** for revenue tied to the partner/format.
+   *Not enabled yet* — the assessment currently posts aspects 1–2 only; the revenue row
+   appears automatically once Snowflake is configured (see below).
 
 The message shows an overall score + GO/FLAG/PASS verdict and a one-sentence reason per
 aspect. Aspects with no data score `n/a` (never penalized). It's idempotent — one
@@ -32,8 +34,12 @@ assessment per proposal thread. Each aspect degrades gracefully: if the feedback
 shared with the integration, or Snowflake isn't configured, that aspect is skipped and the
 score leans on the others.
 
-**Snowflake config (revenue aspect).** Set these as Replit secrets; without them the
-revenue aspect is skipped:
+**Triggers.** The bot assesses automatically when it detects a new proposal in the channel.
+Anyone can also react **👀 (`:eyes:`)** on any message to assess it on demand.
+
+**Enabling the revenue aspect (Snowflake).** Uncomment `snowflake-connector-python` in
+`requirements.txt`, redeploy, and set these as Replit secrets; without all of them the
+revenue aspect stays off:
 
 - `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, and either `SNOWFLAKE_PASSWORD` or
   `SNOWFLAKE_AUTHENTICATOR` (e.g. `SNOWFLAKE_JWT` with a key-pair).
