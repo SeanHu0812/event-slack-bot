@@ -123,17 +123,24 @@ def to_number(v):
         return None
 
 
-PARSE_MODEL = "claude-sonnet-5"                  # accurate default
-FAST_MODEL = "claude-haiku-4-5-20251001"         # faster/cheaper for the change parse
+# Models are env-overridable so we can switch if the API key lacks access to one
+# without a code change / redeploy.
+PARSE_MODEL = os.environ.get("PARSE_MODEL", "claude-sonnet-5")          # accurate default
+FAST_MODEL = os.environ.get("FAST_MODEL", "claude-haiku-4-5-20251001")  # faster/cheaper
 
 
 def ask_json(prompt, max_tokens=700, model=PARSE_MODEL):
-    """Call Claude and parse its reply as JSON. Returns {} on failure. Skips any
-    non-text (e.g. extended-thinking) blocks and strips code fences."""
-    out = claude.messages.create(
-        model=model, max_tokens=max_tokens,
-        system="You output only valid JSON. No prose, no markdown fences.",
-        messages=[{"role": "user", "content": prompt}])
+    """Call Claude and parse its reply as JSON. Returns {} on any failure (API
+    error or unparseable output) so a hiccup degrades a feature rather than
+    crashing the handler. Skips non-text blocks and strips code fences."""
+    try:
+        out = claude.messages.create(
+            model=model, max_tokens=max_tokens,
+            system="You output only valid JSON. No prose, no markdown fences.",
+            messages=[{"role": "user", "content": prompt}])
+    except Exception:
+        log.exception("Claude API call failed (model=%s)", model)
+        return {}
     raw = "".join(b.text for b in out.content if b.type == "text").strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
