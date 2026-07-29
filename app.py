@@ -214,11 +214,21 @@ def sheet_handle():
     return _sheet
 
 
+_csv_cache = {}                                    # url -> (fetched_monotonic, grid)
+_CSV_TTL = 60                                      # seconds; rep/budget sheets change rarely
+
+
 def _fetch_csv_grid(url):
-    """Fetch a published-to-web CSV URL and return it as a list of rows."""
+    """Fetch a published-to-web CSV URL as a list of rows, cached for _CSV_TTL so
+    repeated rep_map()/rep_emails() calls within one action don't re-download it."""
+    hit = _csv_cache.get(url)
+    if hit and time.monotonic() - hit[0] < _CSV_TTL:
+        return hit[1]
     with urllib.request.urlopen(url, timeout=15) as resp:
         data = resp.read().decode("utf-8", "replace")
-    return list(csv.reader(io.StringIO(data)))
+    grid = list(csv.reader(io.StringIO(data)))
+    _csv_cache[url] = (time.monotonic(), grid)
+    return grid
 
 
 def load_grid(tab):
@@ -749,9 +759,9 @@ def find_lead_list(event_name):
     return best if best and best_score >= 0.5 else None
 
 
-def send_lead_list(client, rep_name, event_name):
-    """DM a newly-assigned rep the event's lead list (if one exists). Skips silently
-    when there's no list or the rep has no Slack ID."""
+def send_lead_list(client, rep_name, event_name, invite=None):
+    """DM a newly-assigned rep the event's lead list (if one exists). Links the event
+    name to its invite page when available. Skips silently when there's no list."""
     sid = rep_map().get(rep_name.strip().lower())
     if not sid:
         return
@@ -759,10 +769,11 @@ def send_lead_list(client, rep_name, event_name):
     link = (lead or {}).get("webViewLink")
     if not link:
         return
+    event_ref = f"<{invite}|{event_name}>" if invite else event_name
     try:
         dm = client.conversations_open(users=sid)["channel"]["id"]
         client.chat_postMessage(
-            channel=dm, text=f"Hi <@{sid}>, here's the <{link}|Lead List> for {event_name}")
+            channel=dm, text=f"Hi <@{sid}>, here's the <{link}|Lead List> for {event_ref}")
         log.info("sent lead list to %s for %r", rep_name, event_name)
     except Exception:
         log.exception("failed to send lead list to %s", rep_name)
@@ -1354,7 +1365,7 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     # DM each newly-assigned rep their event's lead list, if one exists.
     for r in add:
         try:
-            send_lead_list(client, r, ev["event"])
+            send_lead_list(client, r, ev["event"], ev.get("invite"))
         except Exception:
             log.exception("lead-list send failed for %s", r)
 
