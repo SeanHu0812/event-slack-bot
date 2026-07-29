@@ -875,6 +875,64 @@ def find_clone(page_id):
     return items[0] if items else None
 
 
+def move_calendar_date(page_id, new_date):
+    """Move this page's New-York-calendar clone to new_date (YYYY-MM-DD), keeping
+    its time-of-day and duration. Silent (no guest email). Returns True if moved."""
+    cal = calendar()
+    if cal is None:
+        return False
+    clone = find_clone(page_id)
+    if not clone:
+        return False
+    start, end = clone.get("start", {}), clone.get("end", {})
+    try:
+        nd = date.fromisoformat(new_date)
+    except ValueError:
+        return False
+    if start.get("dateTime"):                        # timed event: keep time + duration
+        s = datetime.fromisoformat(start["dateTime"])
+        e = datetime.fromisoformat(end["dateTime"]) if end.get("dateTime") else s
+        dur = e - s
+        ns = s.replace(year=nd.year, month=nd.month, day=nd.day)
+        new_start = {"dateTime": ns.isoformat()}
+        new_end = {"dateTime": (ns + dur).isoformat()}
+        if start.get("timeZone"):
+            new_start["timeZone"] = start["timeZone"]
+        if end.get("timeZone"):
+            new_end["timeZone"] = end["timeZone"]
+    else:                                            # all-day: keep the span length
+        os_ = date.fromisoformat(start["date"]) if start.get("date") else nd
+        oe_ = date.fromisoformat(end["date"]) if end.get("date") else (nd + timedelta(days=1))
+        span = (oe_ - os_) or timedelta(days=1)
+        new_start = {"date": nd.isoformat()}
+        new_end = {"date": (nd + span).isoformat()}
+    try:
+        cal.events().patch(calendarId=CAL_TARGET, eventId=clone["id"],
+                           body={"start": new_start, "end": new_end},
+                           sendUpdates="none").execute()
+        return True
+    except Exception:
+        log.exception("failed to move calendar clone for %s", page_id)
+        return False
+
+
+def rename_calendar_clone(page_id, new_name):
+    """Rename this page's calendar clone's summary. Silent. Returns True if renamed."""
+    cal = calendar()
+    if cal is None:
+        return False
+    clone = find_clone(page_id)
+    if not clone:
+        return False
+    try:
+        cal.events().patch(calendarId=CAL_TARGET, eventId=clone["id"],
+                           body={"summary": new_name}, sendUpdates="none").execute()
+        return True
+    except Exception:
+        log.exception("failed to rename calendar clone for %s", page_id)
+        return False
+
+
 def _norm(s):
     return " ".join((s or "").split()).strip().lower()
 
@@ -1229,24 +1287,36 @@ def upcoming_events_for_change():
 
 def parse_mention(text, requester_names, events, valid_opts, context=""):
     """Classify a rep's message to the bot and produce response data:
-    {intent: change|question|none, event_index, remove[], add[], answer}."""
+    {intent: change|edit|question|none, event_index, remove[], add[], changes{}, answer}."""
+    today = date.today().isoformat()
     lines = [f"{i}: {e['date']} | {e.get('city') or '?'} | {e['event']} | "
              f"reps: {', '.join(e['reps']) or 'none'}" for i, e in enumerate(events)]
     who = ", ".join(sorted(requester_names)) if requester_names else "unknown (not in the rep list)"
     convo = f"CONVERSATION SO FAR (oldest first):\n{context}\n\n" if context else ""
     prompt = (
         "A Rho events rep sent a Slack message to the events bot. Decide what they want.\n"
-        f"The sender is known in Notion as: {who}.\n"
-        'Return ONLY JSON: {"intent": "change"|"question"|"none", "event_index": <int or '
-        'null>, "remove": [<names>], "add": [<names>], "answer": <string>}.\n'
+        f"The sender is known in Notion as: {who}. Today's date is {today}.\n"
+        'Return ONLY JSON: {"intent": "change"|"edit"|"question"|"none", "event_index": <int or '
+        'null>, "remove": [<names>], "add": [<names>], "changes": {"date": <YYYY-MM-DD or null>, '
+        '"city": <string or null>, "cost": <number or null>, "partner": <string or null>, '
+        '"invite_link": <string or null>, "event_name": <string or null>}, "answer": <string>}.\n'
         "Intents:\n"
-        "- \"change\": modify rep assignments for ONE event. Set event_index to that event's "
-        "index below (null if unclear/ambiguous) and fill remove/add. Leave answer empty.\n"
+        "- \"change\": modify rep assignments for ONE event. Set event_index and fill remove/add.\n"
+        "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
+        "name). Set event_index and put ONLY the requested field(s) in 'changes'; leave the rest "
+        "null. Use this for messages like 'change the date for X to 8-12' or 'rename Y to Z'.\n"
         "- \"question\": they are ASKING about events or assignments (who is on an event, what "
         "someone is assigned to, how many, when, etc.). Put a concise Slack-formatted answer in "
         "'answer', computed ONLY from the UPCOMING EVENTS below; list events as "
-        "'• <date> — <event>'. If nothing matches, say so plainly. Leave the change fields empty.\n"
+        "'• <date> — <event>'. If nothing matches, say so plainly. Leave other fields empty.\n"
         "- \"none\": anything else (greetings, chit-chat, unrelated). All fields empty.\n"
+        "For both change and edit, set event_index to the matching event's index below (null if "
+        "unclear/ambiguous); match the event by name sensibly (partial/reworded names are fine).\n"
+        "Edit rules:\n"
+        "- date: convert to YYYY-MM-DD. If only month/day is given, pick the year that makes the "
+        "date fall on or after today (the next upcoming occurrence).\n"
+        f"- city: must be exactly one of {sorted(VALID_CITIES)}, or null.\n"
+        "- cost: a plain number of US dollars (e.g. '$3k' -> 3000). null if not mentioned.\n"
         "Change rules:\n"
         "- Use the conversation so far to resolve follow-ups ('the one on the 24th', 'yes').\n"
         "- remove: if the sender refers to themselves ('I','me','can't make it') include their "
@@ -1892,6 +1962,81 @@ def _is_assessment_thread(client, channel, thread_ts):
     return found
 
 
+def _build_event_edits(ev, changes):
+    """From a parsed 'changes' dict, build Notion property updates + human summary.
+    Returns (props, summary_bits, new_date_or_None, new_name_or_None)."""
+    props, bits, new_date, new_name = {}, [], None, None
+    d = (changes.get("date") or "").strip()
+    if d:
+        try:
+            date.fromisoformat(d)
+            props["Date"] = {"date": {"start": d}}
+            bits.append(f"date → {fmt_day(d)}")
+            new_date = d
+        except ValueError:
+            pass
+    city = (changes.get("city") or "").strip()
+    if city in VALID_CITIES:
+        props["City"] = {"select": {"name": city}}
+        bits.append(f"city → {city}")
+    cost = to_number(changes.get("cost"))
+    if cost is not None:
+        props["Estimated Cost"] = {"number": cost}
+        bits.append(f"est. cost → ${cost:,.0f}")
+    partner = (changes.get("partner") or "").strip()
+    if partner:
+        props["Partner"] = rt(partner)
+        bits.append(f"partner → {partner}")
+    invite = (changes.get("invite_link") or "").strip()
+    if invite:
+        props["Invite Link"] = rt(invite)
+        bits.append("invite link updated")
+    name = (changes.get("event_name") or "").strip()
+    if name and name != ev["event"]:
+        props["Event"] = {"title": [{"text": {"content": name}}]}
+        bits.append(f"name → {name}")
+        new_name = name
+    return props, bits, new_date, new_name
+
+
+def handle_event_edit(client, channel, thread_ts, user, ev, changes):
+    """Apply a field edit to an event: write Notion, then (deferred) move/rename the
+    calendar clone on a date/name change and refresh the rundown."""
+    props, bits, new_date, new_name = _build_event_edits(ev, changes)
+    if not props:
+        log.info("edit with no applicable fields; staying silent")
+        return
+    _bot_threads.add((channel, thread_ts))            # engaged — follow the rest of this thread
+    try:
+        notion.pages.update(page_id=ev["id"], properties=props)
+    except Exception:
+        log.exception("notion edit failed for %s", ev["id"])
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                                text=f"Couldn't update *{ev['event']}* just now — try again.")
+        return
+    invalidate_week_cache()
+    log.info("edited %r by %s: %s", ev["event"], user, bits)
+
+    # Response first (snappy); slower calendar/rundown work after.
+    label = new_name or ev["event"]
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts,
+                            text=f":white_check_mark: Updated *{label}*: " + "; ".join(bits) + ".")
+    if new_date:
+        try:
+            move_calendar_date(ev["id"], new_date)
+        except Exception:
+            log.exception("calendar move failed for %s", ev["id"])
+    if new_name:
+        try:
+            rename_calendar_clone(ev["id"], new_name)
+        except Exception:
+            log.exception("calendar rename failed for %s", ev["id"])
+    try:
+        edit_rundowns(client)                         # reflect the change in any live rundown
+    except Exception:
+        log.exception("rundown refresh failed")
+
+
 def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False):
     text = re.sub(r"^\s*<@[A-Z0-9]+>\s*", "", text or "").strip()   # drop leading @bot
     if not text:
@@ -1913,6 +2058,16 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
             log.info("answered assignment question from %s", user)
         else:
             log.info("question with no answer; staying silent")
+        return
+
+    # Editing a field of one event (date, city, cost, partner, invite, name).
+    if intent == "edit":
+        idx = parsed.get("event_index")
+        if not isinstance(idx, int) or not 0 <= idx < len(events):
+            log.info("edit request without a specific event; staying silent")
+            return
+        handle_event_edit(client, channel, thread_ts, user, events[idx],
+                          parsed.get("changes") or {})
         return
 
     # Anything that isn't a concrete change for a specific event -> stay silent.

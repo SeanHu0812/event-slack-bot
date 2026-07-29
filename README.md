@@ -146,7 +146,7 @@ the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet 
 
 ### Rep-assignment Q&A and changes (@mention or DM)
 A rep can **@mention the bot** in a channel, or **DM it**, in plain language. The bot
-classifies each message as a **question**, a **change**, or neither:
+classifies each message as a **question**, a **change**, an **edit**, or neither:
 
 - **Question** ("what upcoming events is Lavar Buckmon on?", "who's assigned to the Founder
   Dinner on the 28th?", "how many events do I have next week?") → the bot answers from the
@@ -154,6 +154,11 @@ classifies each message as a **question**, a **change**, or neither:
 - **Change** ("I can't make the Founder Dinner on the 28th, Marc is covering") → Claude picks
   the single matching upcoming event and the reps to add/remove, the bot **updates the Notion
   `Reps`** field, then replies with exactly what changed.
+- **Edit** ("change the date for VC Dinner w/ Mastercard to 8-12", "rename X to Y", "set the
+  cost for the CADRE dinner to $4k") → the bot updates the matching event's field(s) in Notion
+  (`Date`, `City`, `Estimated Cost`, `Partner`, `Invite Link`, or the event name). A **date**
+  change also **moves the event's New York Calendar clone** (keeping its time-of-day and
+  duration); a **rename** also updates the clone's title. Both are silent (no guest emails).
 - **Neither** (greetings, chit-chat, or a request it can't tie to a specific event) → the
   bot stays silent. Guardrails: only upcoming events;
 a rep to add must already exist in the `Reps` options (no junk options are created);
