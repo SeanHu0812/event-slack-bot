@@ -95,16 +95,22 @@ and posts a spending report
 ephemeral message visible only to you.
 
 ### Weekly rep-assignment rundown
-Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) **NYC**
-events from Notion and:
+Every **Friday 10:00 America/New_York**, the bot reads the **upcoming** week's (Mon–Sun)
+**NYC** events from Notion and:
 - If every event has reps → posts a rundown (events grouped by day, each as
-  `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`.
+  `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`. The message
+  ends with "If you can't make it to any event, please reply under this message. Thanks!"
 - If any event is missing reps → DMs Drew Parten a reminder listing them (with Notion
   links) and adds a `:done:` reaction. When Drew reacts `:done:`, it posts the rundown.
 
-Before posting, the bot scans the channels for a rundown already sent this week and skips
+It's sent Friday (for the week ahead) so reps have the weekend to flag changes early. A
+"cycle" opens each Friday and describes the upcoming week; it keeps describing that same
+week as reps reply into it (through the following Thursday), then the next Friday opens a
+new cycle. Set the send day with `RUNDOWN_WEEKDAY` (0=Mon … 4=Fri).
+
+Before posting, the bot scans the channels for a rundown already sent this cycle and skips
 if found — so a restart/republish (which resets the in-memory schedule flag) can't cause a
-duplicate post. The Drew reminder is likewise not re-sent if one already went out this week.
+duplicate post. The Drew reminder is likewise not re-sent if one already went out this cycle.
 Editing the rundown does **not** re-notify already-tagged reps — only a newly added rep is
 pinged — which is why changes edit in place rather than reposting.
 

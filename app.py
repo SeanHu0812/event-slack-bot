@@ -53,11 +53,15 @@ VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segu
     "Miami", "Montana", "NYC", "Nashville", "New Mexico", "Phoenix", "SF", "San Diego",
     "Seattle", "Vegas", "DC"}
 
-# Weekly rep-assignment rundown (Mondays 10:00 ET).
+# Weekly rep-assignment rundown. Sent Fridays 10:00 ET for the FOLLOWING week, so
+# reps have the weekend to flag changes. The cycle opens each Friday and describes
+# the upcoming Mon-Sun; it keeps describing that week through the following Thu.
 RUNDOWN_TZ = ZoneInfo("America/New_York")
+RUNDOWN_WEEKDAY = 4                      # 0=Mon .. 4=Fri — the day the rundown is sent
 RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
 RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
+RUNDOWN_REPLY_LINE = "If you can't make it to any event, please reply under this message. Thanks!"
 _rundown_msgs = set()                    # (channel, ts) of the latest rundown posts
 
 # Google Calendar: clone rundown events from Sean's personal calendar to the shared one.
@@ -549,10 +553,21 @@ def rep_mention(name, mapping):
     return f"<@{sid}>" if sid else name
 
 
-def week_range():
-    """(monday, sunday) ISO dates for the current week in RUNDOWN_TZ."""
+def rundown_monday():
+    """Monday (date) of the week the rundown currently describes. From the send day
+    (Fri) through Sun it is the UPCOMING week; Mon-Thu it is the current week — so a
+    rundown sent Friday keeps describing the same week as reps reply into it."""
     today = datetime.now(RUNDOWN_TZ).date()
     monday = today - timedelta(days=today.weekday())
+    if today.weekday() >= RUNDOWN_WEEKDAY:           # Fri/Sat/Sun -> the upcoming week
+        monday += timedelta(days=7)
+    return monday
+
+
+def week_range():
+    """(monday, sunday) ISO dates for the week the rundown describes (see
+    rundown_monday) — used everywhere 'this week's events' is needed."""
+    monday = rundown_monday()
     return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
 
 
@@ -628,20 +643,22 @@ def build_rundown(events):
             reps = " ".join(rep_mention(r, mapping) for r in e["reps"])
             out.append(f"• {link}" + (f" - {reps}" if reps else ""))
         out.append("")
+    out.append(RUNDOWN_REPLY_LINE)
     return "\n".join(out).strip()
 
 
-def week_start_epoch():
-    """Unix timestamp for 00:00 ET on this week's Monday."""
-    today = datetime.now(RUNDOWN_TZ).date()
-    monday = today - timedelta(days=today.weekday())
-    return datetime(monday.year, monday.month, monday.day, tzinfo=RUNDOWN_TZ).timestamp()
+def cycle_start_epoch():
+    """Unix ts for 00:00 ET on the Friday that opened the current rundown cycle.
+    Bounds 'this cycle' when scanning for already-posted / editable rundown messages,
+    so the window spans the Friday send through the whole week it describes."""
+    friday = rundown_monday() - timedelta(days=7 - RUNDOWN_WEEKDAY)
+    return datetime(friday.year, friday.month, friday.day, tzinfo=RUNDOWN_TZ).timestamp()
 
 
 def rundown_posted_this_week(client):
     """Scan the rundown channels for a rundown message already posted this week
     (so a restart/republish doesn't cause a duplicate post)."""
-    start = week_start_epoch()
+    start = cycle_start_epoch()
     for ch in RUNDOWN_CHANNELS:
         try:
             msgs = client.conversations_history(channel=ch, limit=100)["messages"]
@@ -662,7 +679,7 @@ def reminder_sent_this_week(client):
         msgs = client.conversations_history(channel=dm, limit=50)["messages"]
     except Exception:
         return False
-    start = week_start_epoch()
+    start = cycle_start_epoch()
     return any(REPS_REMINDER_SENTINEL in (m.get("text") or "") and float(m.get("ts", 0)) >= start
                for m in msgs)
 
@@ -691,7 +708,7 @@ def rundown_ts_all(client, channel):
     plus a history scan — so duplicate posts all stay in sync. Logs read errors
     (missing scope / not in channel) instead of hiding them."""
     found = {ts for ch, ts in _rundown_msgs if ch == channel}
-    start = week_start_epoch()
+    start = cycle_start_epoch()
     try:
         msgs = client.conversations_history(channel=channel, limit=200)["messages"]
     except Exception:
@@ -723,7 +740,7 @@ def edit_rundowns(client):
 
 
 def send_reps_reminder(client, missing):
-    lines = [f"<@{DREW_ID}> Hi happy Monday! {REPS_REMINDER_SENTINEL} for the following events:"]
+    lines = [f"<@{DREW_ID}> Hi happy Friday! {REPS_REMINDER_SENTINEL} for the following events:"]
     for e in missing:
         lines.append(f"{fmt_day(e['date'])} — {e['event']} {e['url']}")
     lines.append("Please complete the assignment and react :done: below. Thanks!")
@@ -1122,7 +1139,7 @@ def update_calendar_guests(page_id, rep_names):
 
 
 def run_weekly_rundown(client):
-    """Monday 10am job: post the rundown, or nudge Drew if reps are missing."""
+    """Friday 10am job: post the rundown, or nudge Drew if reps are missing."""
     events = fetch_week_events()
     if not events:
         log.info("no %s events this week; skipping rundown", RUNDOWN_CITY)
@@ -1150,11 +1167,11 @@ def handle_reps_done(client, channel, ts):
 
 
 def weekly_scheduler(client):
-    """Fire run_weekly_rundown once each Monday during the 10:00 ET hour."""
+    """Fire run_weekly_rundown once each Friday during the 10:00 ET hour."""
     last = None
     while True:
         now = datetime.now(RUNDOWN_TZ)
-        if now.weekday() == 0 and now.hour == 10 and now.date() != last:
+        if now.weekday() == RUNDOWN_WEEKDAY and now.hour == 10 and now.date() != last:
             last = now.date()
             log.info("weekly rundown trigger firing")
             _bg(run_weekly_rundown, client)
