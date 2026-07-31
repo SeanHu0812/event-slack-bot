@@ -1167,11 +1167,14 @@ def handle_reps_done(client, channel, ts):
 
 
 def weekly_scheduler(client):
-    """Fire run_weekly_rundown once each Friday during the 10:00 ET hour."""
+    """Fire run_weekly_rundown once on the send day (Fri), at or after 10:00 ET.
+    Using >= 10 (not == 10) means a republish/restart later in the day still catches
+    up and sends today; run_weekly_rundown's already-posted-this-cycle scan keeps it
+    from double-sending."""
     last = None
     while True:
         now = datetime.now(RUNDOWN_TZ)
-        if now.weekday() == RUNDOWN_WEEKDAY and now.hour == 10 and now.date() != last:
+        if now.weekday() == RUNDOWN_WEEKDAY and now.hour >= 10 and now.date() != last:
             last = now.date()
             log.info("weekly rundown trigger firing")
             _bg(run_weekly_rundown, client)
