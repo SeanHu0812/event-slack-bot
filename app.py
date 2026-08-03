@@ -124,10 +124,11 @@ def to_number(v):
         return None
 
 
-# Models are env-overridable so we can switch if the API key lacks access to one
-# without a code change / redeploy.
-PARSE_MODEL = os.environ.get("PARSE_MODEL", "claude-sonnet-5")          # accurate default
-FAST_MODEL = os.environ.get("FAST_MODEL", "claude-haiku-4-5-20251001")  # faster/cheaper
+# Model IDs are hardcoded on purpose. They are NOT read from env — a stale/bad
+# env override (e.g. FAST_MODEL=claude-3-5-haiku-latest, which this key can't use)
+# was causing 404s. To change a model, edit it here.
+PARSE_MODEL = "claude-sonnet-5"                  # accurate default
+FAST_MODEL = "claude-haiku-4-5-20251001"         # faster/cheaper
 
 
 def ask_json(prompt, max_tokens=700, model=PARSE_MODEL):
