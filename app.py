@@ -53,11 +53,9 @@ VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segu
     "Miami", "Montana", "NYC", "Nashville", "New Mexico", "Phoenix", "SF", "San Diego",
     "Seattle", "Vegas", "DC"}
 
-# Weekly rep-assignment rundown. Sent Fridays 10:00 ET for the FOLLOWING week, so
-# reps have the weekend to flag changes. The cycle opens each Friday and describes
-# the upcoming Mon-Sun; it keeps describing that week through the following Thu.
+# Weekly rep-assignment rundown. Sent Mondays 10:00 ET, covering the current week.
 RUNDOWN_TZ = ZoneInfo("America/New_York")
-RUNDOWN_WEEKDAY = 4                      # 0=Mon .. 4=Fri — the day the rundown is sent
+RUNDOWN_WEEKDAY = 0                      # 0=Mon .. 4=Fri — the day the rundown is sent
 RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
 RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
@@ -554,19 +552,13 @@ def rep_mention(name, mapping):
 
 
 def rundown_monday():
-    """Monday (date) of the week the rundown currently describes. From the send day
-    (Fri) through Sun it is the UPCOMING week; Mon-Thu it is the current week — so a
-    rundown sent Friday keeps describing the same week as reps reply into it."""
+    """Monday (date) of the week the rundown describes — the current week."""
     today = datetime.now(RUNDOWN_TZ).date()
-    monday = today - timedelta(days=today.weekday())
-    if today.weekday() >= RUNDOWN_WEEKDAY:           # Fri/Sat/Sun -> the upcoming week
-        monday += timedelta(days=7)
-    return monday
+    return today - timedelta(days=today.weekday())
 
 
 def week_range():
-    """(monday, sunday) ISO dates for the week the rundown describes (see
-    rundown_monday) — used everywhere 'this week's events' is needed."""
+    """(monday, sunday) ISO dates for the current week in RUNDOWN_TZ."""
     monday = rundown_monday()
     return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
 
@@ -648,11 +640,10 @@ def build_rundown(events):
 
 
 def cycle_start_epoch():
-    """Unix ts for 00:00 ET on the Friday that opened the current rundown cycle.
-    Bounds 'this cycle' when scanning for already-posted / editable rundown messages,
-    so the window spans the Friday send through the whole week it describes."""
-    friday = rundown_monday() - timedelta(days=7 - RUNDOWN_WEEKDAY)
-    return datetime(friday.year, friday.month, friday.day, tzinfo=RUNDOWN_TZ).timestamp()
+    """Unix ts for 00:00 ET on this week's Monday — bounds the dedup/edit scans to
+    the current week."""
+    monday = rundown_monday()
+    return datetime(monday.year, monday.month, monday.day, tzinfo=RUNDOWN_TZ).timestamp()
 
 
 def rundown_posted_this_week(client):
@@ -740,7 +731,7 @@ def edit_rundowns(client):
 
 
 def send_reps_reminder(client, missing):
-    lines = [f"<@{DREW_ID}> Hi happy Friday! {REPS_REMINDER_SENTINEL} for the following events:"]
+    lines = [f"<@{DREW_ID}> Hi happy Monday! {REPS_REMINDER_SENTINEL} for the following events:"]
     for e in missing:
         lines.append(f"{fmt_day(e['date'])} — {e['event']} {e['url']}")
     lines.append("Please complete the assignment and react :done: below. Thanks!")
@@ -1139,7 +1130,7 @@ def update_calendar_guests(page_id, rep_names):
 
 
 def run_weekly_rundown(client):
-    """Friday 10am job: post the rundown, or nudge Drew if reps are missing."""
+    """Monday 10am job: post the rundown, or nudge Drew if reps are missing."""
     events = fetch_week_events()
     if not events:
         log.info("no %s events this week; skipping rundown", RUNDOWN_CITY)
@@ -1167,9 +1158,9 @@ def handle_reps_done(client, channel, ts):
 
 
 def weekly_scheduler(client):
-    """Fire run_weekly_rundown once on the send day (Fri), at or after 10:00 ET.
+    """Fire run_weekly_rundown once on the send day (Mon), at or after 10:00 ET.
     Using >= 10 (not == 10) means a republish/restart later in the day still catches
-    up and sends today; run_weekly_rundown's already-posted-this-cycle scan keeps it
+    up and sends that day; run_weekly_rundown's already-posted-this-week scan keeps it
     from double-sending."""
     last = None
     while True:
