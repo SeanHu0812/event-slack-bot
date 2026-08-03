@@ -97,18 +97,19 @@ ephemeral message visible only to you.
 ### Weekly rep-assignment rundown
 Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) **NYC**
 events from Notion and:
-- If every event has reps → posts a rundown (events grouped by day, each as
+- **Always posts the rundown** (events grouped by day, each as
   `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`. The message
   ends with "If you can't make it to any event, please reply under this message. Thanks!"
-- If any event is missing reps → DMs Drew Parten a reminder listing them (with Notion
-  links) and adds a `:done:` reaction. When Drew reacts `:done:`, it posts the rundown.
+- If any event is **missing reps**, it also DMs Sean (`REPS_ALERT_USER`) an FYI listing them
+  (with Notion links) — once per week. It's a heads-up, not a gate; the rundown posts either
+  way, and assigning the reps updates the message.
 
 The trigger fires on the send day at or after 10:00 ET (`RUNDOWN_WEEKDAY`, 0=Mon), so a
 republish later in the day still sends that day rather than skipping the week.
 
 Before posting, the bot scans the channels for a rundown already sent this week and skips
 if found — so a restart/republish (which resets the in-memory schedule flag) can't cause a
-duplicate post. The Drew reminder is likewise not re-sent if one already went out this week.
+duplicate post. The missing-reps FYI is likewise not re-sent if one already went out this week.
 Editing the rundown does **not** re-notify already-tagged reps — only a newly added rep is
 pinged — which is why changes edit in place rather than reposting.
 
@@ -208,8 +209,8 @@ active reps are free — the same check, on demand.
 
 - Socket Mode enabled → `xapp-` app-level token with `connections:write`.
 - Bot scopes: `reactions:read`, `channels:history`, `chat:write`, `users:read`,
-  **`reactions:write`** (seed ✅/:done: reactions), **`commands`** (slash commands),
-  **`im:write`** + **`im:history`** (DM Drew / accept rep DMs), **`app_mentions:read`**
+  **`reactions:write`** (seed ✅ + 👍 reactions), **`commands`** (slash commands),
+  **`im:write`** + **`im:history`** (DM the missing-reps FYI / accept rep DMs), **`app_mentions:read`**
   (accept @mentions), **`groups:history`** (read/edit rundowns in the **private**
   #qualifiers-across-department channel — without it, edits there silently fail).
 - Event subscriptions (bot events): `reaction_added`, `message.channels`,
@@ -220,7 +221,6 @@ active reps are free — the same check, on demand.
   In Socket Mode no Request URL is needed.
 - Bot invited to #community-team, **#ny-vc-squad**, and **#qualifiers-across-department**
   (`/invite @your-bot`).
-- Custom emoji **`:done:`** must exist in the workspace.
 - **Reinstall the app** after changing scopes, events, or commands.
 
 ## Budget sheet config

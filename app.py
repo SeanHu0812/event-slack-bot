@@ -71,8 +71,7 @@ ENRICHMENT_FOLDER_ID = "1pgMUAiBOOVFMleeGuPSFKi5-IXyjNpCB"   # Drive: Enrichment
 # Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
 RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
     "RUNDOWN_CHANNELS", "C077WPGU528,C08KPMCU6P9").split(",") if c.strip()]
-DREW_ID = "U037HBMJBHU"                  # reps-assignment owner, DMed when reps are missing
-DONE_EMOJI = "done"                      # Drew reacts this to release the rundown
+REPS_ALERT_USER = "U0BER9VC6NA"          # Sean — DMed (FYI) when events are missing reps
 REPS_REMINDER_SENTINEL = "Reps assignment are missing"
 MY_EVENTS_HORIZON_DAYS = 60              # how far ahead /my-event looks
 ASSIGN_HORIZON_DAYS = 90                 # how far ahead @-mention reassignments can reach
@@ -664,9 +663,9 @@ def rundown_posted_this_week(client):
 
 
 def reminder_sent_this_week(client):
-    """Has Drew already been DMed a reps reminder this week?"""
+    """Has the missing-reps FYI already been DMed this week?"""
     try:
-        dm = client.conversations_open(users=DREW_ID)["channel"]["id"]
+        dm = client.conversations_open(users=REPS_ALERT_USER)["channel"]["id"]
         msgs = client.conversations_history(channel=dm, limit=50)["messages"]
     except Exception:
         return False
@@ -731,17 +730,14 @@ def edit_rundowns(client):
 
 
 def send_reps_reminder(client, missing):
-    lines = [f"<@{DREW_ID}> Hi happy Monday! {REPS_REMINDER_SENTINEL} for the following events:"]
+    """FYI DM to Sean listing this week's events that still have no reps."""
+    lines = [f"Hi! {REPS_REMINDER_SENTINEL} for the following events this week:"]
     for e in missing:
         lines.append(f"{fmt_day(e['date'])} — {e['event']} {e['url']}")
-    lines.append("Please complete the assignment and react :done: below. Thanks!")
-    dm = client.conversations_open(users=DREW_ID)["channel"]["id"]
-    resp = client.chat_postMessage(channel=dm, text="\n".join(lines))
-    try:
-        client.reactions_add(channel=dm, timestamp=resp["ts"], name=DONE_EMOJI)
-    except Exception:
-        log.warning("could not add :%s: reaction (needs reactions:write / valid emoji)", DONE_EMOJI)
-    log.info("DMed Drew a reps reminder for %d event(s)", len(missing))
+    lines.append("The rundown has been posted; assign reps and it'll update. Thanks!")
+    dm = client.conversations_open(users=REPS_ALERT_USER)["channel"]["id"]
+    client.chat_postMessage(channel=dm, text="\n".join(lines))
+    log.info("DMed the missing-reps FYI for %d event(s)", len(missing))
 
 
 # ---------------------------------------------------------------------------
@@ -1130,31 +1126,16 @@ def update_calendar_guests(page_id, rep_names):
 
 
 def run_weekly_rundown(client):
-    """Monday 10am job: post the rundown, or nudge Drew if reps are missing."""
+    """Monday 10am job: always post the rundown, and DM Sean an FYI if any events
+    are still missing reps (no longer gated on a reaction)."""
     events = fetch_week_events()
     if not events:
         log.info("no %s events this week; skipping rundown", RUNDOWN_CITY)
         return
+    post_rundown(client, events)
     missing = [e for e in events if not e["reps"]]
-    if missing:
-        if reminder_sent_this_week(client):
-            log.info("reps reminder already sent this week; skipping")
-            return
+    if missing and not reminder_sent_this_week(client):
         send_reps_reminder(client, missing)
-    else:
-        post_rundown(client, events)
-
-
-def handle_reps_done(client, channel, ts):
-    """Drew reacted :done: on the reminder DM — post the rundown now."""
-    msg = client.conversations_history(
-        channel=channel, latest=ts, inclusive=True, limit=1)["messages"][0]
-    if REPS_REMINDER_SENTINEL not in (msg.get("text") or ""):
-        return                                    # not our reminder message
-    events = fetch_week_events()
-    if events:
-        post_rundown(client, events)
-    log.info("Drew confirmed reps; posted rundown")
 
 
 def weekly_scheduler(client):
@@ -2264,10 +2245,6 @@ def on_reaction(event, client):
     log.info("reaction_added: reaction=%r user=%r channel=%r type=%r",
              reaction, user, channel, item.get("type"))
     if item.get("type") != "message":
-        return
-    # Drew releasing the weekly rundown from the reminder DM.
-    if reaction == DONE_EMOJI and user == DREW_ID:
-        _bg(handle_reps_done, client, channel, ts)
         return
     # 👀 on any #community-team message manually triggers an assessment.
     if reaction == ASSESS_EMOJI and channel == CHANNEL:
