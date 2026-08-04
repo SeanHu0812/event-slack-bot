@@ -59,7 +59,7 @@ RUNDOWN_WEEKDAY = 0                      # 0=Mon .. 4=Fri — the day the rundow
 RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
 RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
 RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
-RUNDOWN_REPLY_LINE = "If you can't make it to any event, please reply under this message. Thanks!"
+RUNDOWN_REPLY_LINE = "Can no longer make it to an event? Tag me and let me know. Thanks!"
 _rundown_msgs = set()                    # (channel, ts) of the latest rundown posts
 
 # Google Calendar: clone rundown events from Sean's personal calendar to the shared one.
@@ -2260,33 +2260,6 @@ def on_reaction(event, client):
         _bg(handle_confirmation, client, ts)
 
 
-def handle_thread_reply(client, channel, thread_ts, msg_ts, user, text):
-    """Handle a reply in any thread the bot is part of — a rundown, a prior
-    conversation, or any thread where Event-Bot has posted — even without an
-    @mention. Recognizes the thread from memory, or by reading it (restart-safe)."""
-    if _is_assessment_thread(client, channel, thread_ts):
-        return          # assessment threads: only @-mentions count as feedback (on_app_mention)
-    if (channel, thread_ts) in _bot_threads:
-        handle_mention(client, channel, thread_ts, msg_ts, user, text)
-        return
-    if (channel, thread_ts) in _rundown_msgs:
-        handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=True)
-        return
-    try:
-        msgs = client.conversations_replies(channel=channel, ts=thread_ts, limit=50)["messages"]
-    except Exception:
-        return
-    parent = msgs[0] if msgs else {}
-    is_rundown = bool(parent.get("bot_id") or parent.get("user") == BOT_USER_ID) and \
-        RUNDOWN_SENTINEL in (parent.get("text") or "")
-    bot_here = any(m.get("bot_id") or m.get("user") == BOT_USER_ID for m in msgs)
-    if is_rundown:
-        handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=True)
-    elif bot_here:
-        handle_mention(client, channel, thread_ts, msg_ts, user, text)
-    # else: not a thread the bot is in -> ignore
-
-
 @app.event("app_mention")
 def on_app_mention(event, client):
     """An @-mention: assessment-thread feedback, else a rep-assignment change."""
@@ -2319,9 +2292,9 @@ def on_message(event, client):
     # Channel @mentions are handled by on_app_mention (avoid double-processing).
     if BOT_USER_ID and f"<@{BOT_USER_ID}>" in text:
         return
-    # Any thread reply -> handle it if the bot is part of that thread (decided in _bg).
+    # Plain (non-@mention) thread replies are ignored — the bot acts only on
+    # @mentions and DMs. (This also covers replies under the weekly rundown.)
     if thread_ts:
-        _bg(handle_thread_reply, client, channel, thread_ts, ts, user, text)
         return
     # Top-level community-channel message — proposal heads-up + assessment.
     if channel != CHANNEL:

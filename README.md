@@ -99,7 +99,7 @@ Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) *
 events from Notion and:
 - **Always posts the rundown** (events grouped by day, each as
   `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`. The message
-  ends with "If you can't make it to any event, please reply under this message. Thanks!"
+  ends with "Can no longer make it to an event? Tag me and let me know. Thanks!"
 - If any event is **missing reps**, it also DMs Sean (`REPS_ALERT_USER`) an FYI listing them
   (with Notion links) — once per week. It's a heads-up, not a gate; the rundown posts either
   way, and assigning the reps updates the message.
@@ -170,14 +170,14 @@ a rep to add must already exist in the `Reps` options (no junk options are creat
 "me/I" resolves to the sender via `REP_MAP_CSV`; if the event is ambiguous or a name can't
 be resolved, the bot asks to clarify instead of writing.
 
-The conversation can continue **in-thread**: any reply in a thread where Event-Bot has
-posted is read — with no new @mention needed (recognized even after a restart by reading
-the thread) — and prior thread messages are given to Claude so "the one on the 24th" / "yes"
-resolve.
+The bot acts **only on @mentions and DMs** — plain thread replies (including replies under
+the weekly rundown) are ignored, so it never chimes in on messages that aren't directed at
+it. To continue a conversation, **@mention it again**; prior thread messages are still given
+to Claude so "the one on the 24th" / "yes" resolve.
 
 If a rep says they **can't make an event but names no replacement**, the bot removes them and
 asks *"Who will be taking <name>'s place?"*, listing the **available reps** (plain names, no
-tags). The approver can just reply in the thread with a name to fill the slot.
+tags). @mention the bot with a name to fill the slot.
 
 Availability is checked against reps' **real Google Calendars** (free/busy) at the event's
 time when a time is known — reps with a conflict are dropped; anyone whose free/busy is hidden
