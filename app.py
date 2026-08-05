@@ -1541,14 +1541,16 @@ def fetch_all_feedback():
     global _feedback_cache, _feedback_ts
     if _feedback_cache is not None and (time.time() - _feedback_ts) < _FEEDBACK_TTL:
         return _feedback_cache
-    rows, cursor = [], None
+    rows, cursor, scanned, ok = [], None, 0, True
     try:
         for _ in range(FEEDBACK_HISTORY_PAGES):
             kw = {"channel": FEEDBACK_CHANNEL, "limit": 100}
             if cursor:
                 kw["cursor"] = cursor
             r = app.client.conversations_history(**kw)
-            for m in r.get("messages", []):
+            msgs = r.get("messages", [])
+            scanned += len(msgs)
+            for m in msgs:
                 row = _parse_tally(_message_fulltext(m))
                 if row:
                     rows.append(row)
@@ -1556,22 +1558,32 @@ def fetch_all_feedback():
             if not cursor:
                 break
     except Exception:
-        log.exception("could not read #events-feedback (is the bot a member of it?)")
-    _feedback_cache, _feedback_ts = rows, time.time()
+        ok = False
+        log.exception("could not read #events-feedback %s — is the bot a member "
+                      "(/invite) and is the channel ID right?", FEEDBACK_CHANNEL)
+    log.info("feedback: scanned %d msg(s) from %s, parsed %d submission(s)",
+             scanned, FEEDBACK_CHANNEL, len(rows))
+    if ok:                                           # don't cache a failed read
+        _feedback_cache, _feedback_ts = rows, time.time()
     return rows
 
 
 def relevant_feedback(partner, event_name, limit=8):
     """Feedback rows most similar to this partner/format, by token overlap."""
     terms = _tok(partner) | _tok(event_name)
+    all_rows = fetch_all_feedback()
     if not terms:
+        log.info("feedback match: no usable terms from partner=%r event=%r (had %d rows)",
+                 partner, event_name, len(all_rows))
         return []
     scored = []
-    for r in fetch_all_feedback():
+    for r in all_rows:
         overlap = len(terms & (_tok(r["partner"]) | _tok(r["event"])))
         if overlap:
             scored.append((overlap, r))
     scored.sort(key=lambda x: -x[0])
+    log.info("feedback match: %d of %d rows relevant to terms %s",
+             len(scored), len(all_rows), sorted(terms))
     return [r for _, r in scored[:limit]]
 
 
