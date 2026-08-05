@@ -1485,15 +1485,22 @@ _TALLY_FIELD_RE = re.compile(r"\*([^*\n]+)\*[ \t]*\n(.*?)(?=\n\*[^*\n]+\*[ \t]*\
 
 def _message_fulltext(m):
     """All human-readable text of a Slack message, incl. attachments/blocks —
-    Tally submissions often carry their content there rather than in `text`."""
+    Tally submissions often carry their content there rather than in `text`.
+    Normalizes structured field pairs (title/value) into "*title*\\nvalue" so the
+    Tally field regex can read them regardless of whether Tally posts mrkdwn text,
+    block fields, or legacy attachment fields."""
     parts = [m.get("text") or ""]
     for a in m.get("attachments") or []:
         parts += [a.get("pretext") or "", a.get("text") or "", a.get("fallback") or ""]
+        for f in a.get("fields") or []:                 # legacy attachment fields
+            title, val = (f.get("title") or "").strip(), (f.get("value") or "").strip()
+            if title or val:
+                parts.append(f"*{title}*\n{val}" if title else val)
     for b in m.get("blocks") or []:
         t = b.get("text")
         if isinstance(t, dict):
             parts.append(t.get("text") or "")
-        for f in b.get("fields") or []:
+        for f in b.get("fields") or []:                 # Block Kit section fields
             if isinstance(f, dict):
                 parts.append(f.get("text") or "")
     return "\n".join(p for p in parts if p)
