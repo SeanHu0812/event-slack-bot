@@ -16,6 +16,10 @@ No DMs, no other output.
 4. Parses the free-text proposal into clean JSON with one Anthropic call.
 5. Creates the Notion page (title + date + city/partner/cost/invite link + dedup marker).
 
+**Deleting bot messages:** an approver (Justin or Sean) can react **🗑️ (`:wastebasket:`)**
+on any Event-Bot message, in any channel, to delete it. It only ever removes the bot's own
+messages — Slack won't let `chat.delete` touch anyone else's.
+
 ### Proposal auto-assessment (1–10 score)
 When a proposal is posted in #community-team, the bot replies in-thread with a 1–10
 assessment across three aspects, so approvers have a read before they `:approved:`:

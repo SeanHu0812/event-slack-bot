@@ -36,6 +36,7 @@ log = logging.getLogger("events-bot")
 CHANNEL       = "C08K7K31ML6"    # #community-team
 APPROVE_EMOJI = "approved"       # Slack sends the bare name, no colons
 CONFIRM_EMOJI = "white_check_mark"   # ✅ used to confirm an over-budget event
+DELETE_EMOJI = "wastebasket"     # 🗑️ an approver reacts to delete one of the bot's own messages
 APPROVERS     = {"U03MEKGQPFC",  # Justin
                  "U0BER9VC6NA"}  # Sean
 DB_ID         = "5acc7ada733042a3ace3433f828455b6"   # 2026 Events & Community Calendar
@@ -2257,6 +2258,18 @@ def handle_confirmation(client, confirm_ts):
     create_and_reply(client, fields, proposal_ts, budget_status(fields))
 
 
+def _delete_bot_message(client, channel, ts):
+    """Delete a message the bot posted (triggered by an approver's 🗑️ reaction).
+    Slack only lets chat.delete remove messages posted by the same token, so this
+    can never delete anyone else's message — a non-bot target just errors out."""
+    try:
+        client.chat_delete(channel=channel, ts=ts)
+        log.info("deleted bot message %s in %s via 🗑️", ts, channel)
+    except Exception:
+        log.warning("could not delete %s in %s — not the bot's own message, or "
+                    "missing permission", ts, channel)
+
+
 @app.event("reaction_added")
 def on_reaction(event, client):
     item = event.get("item", {})
@@ -2265,6 +2278,10 @@ def on_reaction(event, client):
     log.info("reaction_added: reaction=%r user=%r channel=%r type=%r",
              reaction, user, channel, item.get("type"))
     if item.get("type") != "message":
+        return
+    # 🗑️ an approver deletes one of the bot's own messages (any channel).
+    if reaction == DELETE_EMOJI and user in APPROVERS:
+        _bg(_delete_bot_message, client, channel, ts)
         return
     # 👀 on any #community-team message manually triggers an assessment.
     if reaction == ASSESS_EMOJI and channel == CHANNEL:
