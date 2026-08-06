@@ -573,10 +573,11 @@ _WEEK_TTL = 20                                   # short: dedupes repeated reads
 
 
 def invalidate_week_cache():
-    """Drop the this-week events cache — call right after any Notion write so the
-    next read reflects the change (e.g. the rundown edit after a rep change)."""
-    global _week_cache
+    """Drop the events caches — call right after any Notion write so the next read
+    reflects the change (e.g. the rundown edit after a rep change, or Q&A)."""
+    global _week_cache, _all_events_cache
     _week_cache = None
+    _all_events_cache = None
 
 
 def fetch_week_events():
@@ -1290,6 +1291,90 @@ def upcoming_events_for_change():
     return evs
 
 
+_all_events_cache = None
+_all_events_ts = 0.0
+_ALL_EVENTS_TTL = 300             # 5 min
+
+
+def fetch_all_events():
+    """Every event in the Notion calendar (any city, all dates), newest first,
+    compact + cached. Powers keyword Q&A over the full event history."""
+    global _all_events_cache, _all_events_ts
+    if _all_events_cache is not None and (time.time() - _all_events_ts) < _ALL_EVENTS_TTL:
+        return _all_events_cache
+    evs, cursor, pages = [], None, 0
+    try:
+        while pages < 40:                            # safety cap ~4000 events
+            kwargs = {"data_source_id": data_source_id(), "page_size": 100,
+                      "sorts": [{"property": "Date", "direction": "descending"}]}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            r = notion.data_sources.query(**kwargs)
+            for p in r["results"]:
+                pr = p["properties"]
+                name = _plain(pr["Event"]["title"]).strip()
+                if not name or name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
+                    continue
+                d = (pr.get("Date") or {}).get("date") or {}
+                evs.append({
+                    "event": name,
+                    "date": (d.get("start") or "")[:10],
+                    "city": (pr.get("City", {}).get("select") or {}).get("name"),
+                    "partner": _plain(pr.get("Partner", {}).get("rich_text")),
+                    "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])],
+                })
+            cursor = r.get("next_cursor")
+            pages += 1
+            if not r.get("has_more"):
+                break
+    except Exception:
+        log.exception("could not read the full events calendar")
+        return _all_events_cache or []
+    _all_events_cache, _all_events_ts = evs, time.time()
+    log.info("calendar: loaded %d events for Q&A", len(evs))
+    return evs
+
+
+def search_events(terms):
+    """Events whose name/partner/reps/city contains any keyword (substring,
+    case-insensitive). Empty terms -> the whole calendar."""
+    evs = fetch_all_events()
+    low = [t.strip().lower() for t in (terms or []) if t and t.strip()]
+    if not low:
+        return evs
+    out = []
+    for e in evs:
+        hay = " ".join([e["event"], e.get("partner") or "", e.get("city") or "",
+                        " ".join(e["reps"])]).lower()
+        if any(t in hay for t in low):
+            out.append(e)
+    return out
+
+
+def answer_event_question(text, terms, cap=150):
+    """Answer any question about our events by searching the full calendar."""
+    matches = search_events(terms)
+    total = len(matches)
+    shown = matches[:cap]
+    lines = [f"{e['date'] or '?'} | {e.get('city') or '?'} | {e['event']} | "
+             f"partner: {e.get('partner') or '—'} | reps: {', '.join(e['reps']) or 'none'}"
+             for e in shown]
+    header = (f"{total} matching event(s)"
+              + (f", showing the {len(shown)} most recent" if total > len(shown) else ""))
+    log.info("event Q&A: terms=%s matched %d event(s)", terms, total)
+    out = ask_json(
+        "Answer the teammate's question about Rho's events using ONLY the EVENTS listed below "
+        "(our full calendar — past and upcoming — filtered to their query). Be concise and "
+        f"Slack-formatted. Today is {date.today().isoformat()}, so resolve 'this week'/'last "
+        "year' etc. from the dates. Count precisely; for 'who went/attended', list the reps. If "
+        f"the total count matters and the list is truncated, use the stated total ({total}). If "
+        "the events don't answer the question, say so plainly. Never invent events. Return ONLY "
+        "JSON {\"answer\": <string>}.\n\n"
+        f"QUESTION:\n{text}\n\nEVENTS ({header}):\n" + "\n".join(lines),
+        max_tokens=1200)
+    return (out.get("answer") or "").strip() or "I couldn't find anything matching that."
+
+
 def parse_mention(text, requester_names, events, valid_opts, context=""):
     """Classify a rep's message to the bot and produce response data:
     {intent: change|edit|question|none, event_index, remove[], add[], changes{}, answer}."""
@@ -1305,7 +1390,8 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         '"event_index": <int or null>, "remove": [<names>], "add": [<names>], '
         '"changes": {"date": <YYYY-MM-DD or null>, "city": <string or null>, '
         '"cost": <number or null>, "partner": <string or null>, "invite_link": <string or null>, '
-        '"event_name": <string or null>}, "topic": <string or null>, "answer": <string>}.\n'
+        '"event_name": <string or null>}, "topic": <string or null>, '
+        '"search_terms": [<keywords>], "answer": <string>}.\n'
         "Intents:\n"
         "- \"change\": modify rep assignments for ONE event. Set event_index and fill remove/add.\n"
         "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
@@ -1315,10 +1401,12 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         "partner, host, or format) — e.g. 'any feedback from prior events with Verci?', 'how did "
         "the CADRE dinners go?'. Set 'topic' to the partner/host/format they're asking about "
         "(e.g. 'Verci'). Leave other fields empty.\n"
-        "- \"question\": they are ASKING about events or ASSIGNMENTS (who is on an event, what "
-        "someone is assigned to, how many, when, etc.). Put a concise Slack-formatted answer in "
-        "'answer', computed ONLY from the UPCOMING EVENTS below; list events as "
-        "'• <date> — <event>'. If nothing matches, say so plainly. Leave other fields empty.\n"
+        "- \"question\": they are ASKING anything about our events, past OR upcoming (who "
+        "attended/is assigned, how many events with a partner, when we last did X, totals, etc.). "
+        "Put the key entities to look up in 'search_terms' — partner/host names, event-name "
+        "keywords, a city, and/or a person's name (e.g. ['Verci'] or ['Jason']). Use [] only for "
+        "a broad question with no specific entity (e.g. 'how many events did we do this year'). "
+        "Leave 'answer' empty — the answer is computed separately from the full calendar.\n"
         "- \"none\": anything else (greetings, chit-chat, unrelated). All fields empty.\n"
         "For both change and edit, set event_index to the matching event's index below (null if "
         "unclear/ambiguous); match the event by name sensibly (partial/reworded names are fine).\n"
@@ -2106,15 +2194,12 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     parsed = parse_mention(text, requester, events, valid, context)
     intent = parsed.get("intent")
 
-    # Answering a question about events / assignments.
+    # Answering any question about our events — searches the FULL Notion calendar.
     if intent == "question":
-        answer = (parsed.get("answer") or "").strip()
-        if answer:
-            _bot_threads.add((channel, thread_ts))
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
-            log.info("answered assignment question from %s", user)
-        else:
-            log.info("question with no answer; staying silent")
+        _bot_threads.add((channel, thread_ts))
+        answer = answer_event_question(text, parsed.get("search_terms"))
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+        log.info("answered event question from %s (terms=%s)", user, parsed.get("search_terms"))
         return
 
     # Answering a question about PAST FEEDBACK (from #events-feedback).

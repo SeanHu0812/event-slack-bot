@@ -157,9 +157,11 @@ the events they're assigned to. Ephemeral; if the caller isn't in the rep sheet 
 A rep can **@mention the bot** in a channel, or **DM it**, in plain language. The bot
 classifies each message as a **question**, a **change**, an **edit**, or neither:
 
-- **Question** ("what upcoming events is Lavar Buckmon on?", "who's assigned to the Founder
-  Dinner on the 28th?", "how many events do I have next week?") → the bot answers from the
-  Notion event data.
+- **Question** ("how many events did we do with Verci?", "who went to the CADRE dinner?",
+  "when did we last work with CoFound?", "what's Lavar on next week?") → the bot **keyword-
+  searches the entire Notion calendar** (all cities, past *and* upcoming — matching on event
+  name, partner, city, and rep names), then answers from the matches. It can count, list
+  attendees, and reason over history, not just upcoming events. The calendar is cached ~5 min.
 - **Change** ("I can't make the Founder Dinner on the 28th, Marc is covering") → Claude picks
   the single matching upcoming event and the reps to add/remove, the bot **updates the Notion
   `Reps`** field, then replies with exactly what changed.
