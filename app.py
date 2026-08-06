@@ -1322,6 +1322,10 @@ def fetch_all_events():
                     "city": (pr.get("City", {}).get("select") or {}).get("name"),
                     "partner": _plain(pr.get("Partner", {}).get("rich_text")),
                     "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])],
+                    "venue": _plain(pr.get("Venue", {}).get("rich_text")),
+                    "est_cost": (pr.get("Estimated Cost") or {}).get("number"),
+                    "actual_cost": (pr.get("Actual Cost") or {}).get("number"),
+                    "invite": first_url(_plain(pr.get("Invite Link", {}).get("rich_text"))),
                 })
             cursor = r.get("next_cursor")
             pages += 1
@@ -1336,8 +1340,10 @@ def fetch_all_events():
 
 
 def search_events(terms):
-    """Events whose name/partner/reps/city contains any keyword (substring,
-    case-insensitive). Empty terms -> the whole calendar."""
+    """Events whose event NAME or PARTNER (also city/reps) contains any keyword
+    (substring, case-insensitive). Searching both name and partner matters — some
+    partners are only in the title, others only in the Partner field. Empty terms
+    -> the whole calendar."""
     evs = fetch_all_events()
     low = [t.strip().lower() for t in (terms or []) if t and t.strip()]
     if not low:
@@ -1351,14 +1357,28 @@ def search_events(terms):
     return out
 
 
+def _event_detail_line(e):
+    parts = [e["date"] or "?", e.get("city") or "?", e["event"],
+             f"partner: {e.get('partner') or '—'}",
+             f"reps: {', '.join(e['reps']) or 'none'}"]
+    if e.get("venue"):
+        parts.append(f"venue: {e['venue']}")
+    if e.get("est_cost") is not None:
+        parts.append(f"est cost: ${e['est_cost']:,.0f}")
+    if e.get("actual_cost") is not None:
+        parts.append(f"actual cost: ${e['actual_cost']:,.0f}")
+    if e.get("invite"):
+        parts.append(f"invite: {e['invite']}")
+    return " | ".join(parts)
+
+
 def answer_event_question(text, terms, cap=150):
-    """Answer any question about our events by searching the full calendar."""
+    """Answer any question about our events by searching the full calendar (matching
+    on event name AND partner field, plus city/reps) and reading full details."""
     matches = search_events(terms)
     total = len(matches)
     shown = matches[:cap]
-    lines = [f"{e['date'] or '?'} | {e.get('city') or '?'} | {e['event']} | "
-             f"partner: {e.get('partner') or '—'} | reps: {', '.join(e['reps']) or 'none'}"
-             for e in shown]
+    lines = [_event_detail_line(e) for e in shown]
     header = (f"{total} matching event(s)"
               + (f", showing the {len(shown)} most recent" if total > len(shown) else ""))
     log.info("event Q&A: terms=%s matched %d event(s)", terms, total)
