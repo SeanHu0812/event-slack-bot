@@ -1678,21 +1678,29 @@ def fetch_all_feedback():
 
 
 def relevant_feedback(partner, event_name, limit=8):
-    """Feedback rows most similar to this partner/format, by token overlap."""
+    """Feedback rows most similar to this partner/format. Matches keywords against
+    BOTH the feedback's partner field AND its event title — the partner field is a
+    newer addition, so most older feedback only names the partner in the title.
+    Also substring-matches the partner/event phrase so multi-word or partial partner
+    names (e.g. 'Left Lane Capital') hit the title reliably."""
     terms = _tok(partner) | _tok(event_name)
+    phrases = [p.strip().lower() for p in (partner, event_name) if p and len(p.strip()) >= 3]
     all_rows = fetch_all_feedback()
-    if not terms:
+    if not terms and not phrases:
         log.info("feedback match: no usable terms from partner=%r event=%r (had %d rows)",
                  partner, event_name, len(all_rows))
         return []
     scored = []
     for r in all_rows:
-        overlap = len(terms & (_tok(r["partner"]) | _tok(r["event"])))
-        if overlap:
-            scored.append((overlap, r))
+        hay_text = f"{r.get('partner', '')} {r.get('event', '')}".lower()   # partner + title
+        score = len(terms & (_tok(r.get("partner")) | _tok(r.get("event"))))
+        if any(ph in hay_text for ph in phrases):                            # phrase in title/partner
+            score += 2
+        if score:
+            scored.append((score, r))
     scored.sort(key=lambda x: -x[0])
-    log.info("feedback match: %d of %d rows relevant to terms %s",
-             len(scored), len(all_rows), sorted(terms))
+    log.info("feedback match: %d of %d rows relevant to %s",
+             len(scored), len(all_rows), sorted(terms) or phrases)
     return [r for _, r in scored[:limit]]
 
 
