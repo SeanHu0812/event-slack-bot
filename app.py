@@ -85,7 +85,7 @@ BOT_USER_ID = None                       # resolved at startup, to ignore our ow
 # submissions) — the source-of-truth superset; the synced Notion DB was lossy.
 # The bot must be a member of this channel (channels:history).
 FEEDBACK_CHANNEL = os.environ.get("FEEDBACK_CHANNEL_ID", "C092PD0RD4L")
-FEEDBACK_HISTORY_PAGES = 4               # ~400 most-recent messages scanned
+FEEDBACK_HISTORY_PAGES = 12              # ~1200 most-recent messages scanned (months of history)
 ASSESS_SENTINEL = "Event assessment"     # header text; also used to skip re-assessing
 ASSESS_MIN_LEN = 40                      # ignore short chatter; proposals are longer
 ASSESS_EMOJI = "eyes"                    # 👀 — manually trigger an assessment on any message
@@ -1540,6 +1540,14 @@ def _parse_tally(text):
             row["right_people"] = v
         elif "feedback" in l or l.startswith("what did you think"):
             row["feedback"] = v
+            # Some form variants embed the event name in the question label itself
+            # ("What feedback do you have about the <EVENT>?") instead of a separate
+            # *event* field — recover it so the event is searchable.
+            if not row["event"]:
+                m = re.search(r"(?:about|of|for)\s+the\s+(.+?)\??$", label.strip(), re.I)
+                cand = (m.group(1).strip() if m else "")
+                if cand and cand.lower() != "event":
+                    row["event"] = cand.replace("&amp;", "&")
     if not (row["event"] or row["feedback"]):
         return None
     if row["event"].strip().upper().startswith("TEST") or \
