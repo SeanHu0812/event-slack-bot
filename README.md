@@ -163,6 +163,10 @@ classifies each message as a **question**, a **change**, an **edit**, or neither
 - **Change** ("I can't make the Founder Dinner on the 28th, Marc is covering") → Claude picks
   the single matching upcoming event and the reps to add/remove, the bot **updates the Notion
   `Reps`** field, then replies with exactly what changed.
+- **Feedback question** ("any feedback from prior events with Verci?", "how did the CADRE
+  dinners go?") → the bot searches **#events-feedback** for matching submissions and summarizes
+  what we learned (partner/audience fit, lead quality, recurring notes). If it can't read the
+  channel, it says so (a hint it needs to be invited).
 - **Edit** ("change the date for VC Dinner w/ Mastercard to 8-12", "rename X to Y", "set the
   cost for the CADRE dinner to $4k") → the bot updates the matching event's field(s) in Notion
   (`Date`, `City`, `Estimated Cost`, `Partner`, `Invite Link`, or the event name). A **date**

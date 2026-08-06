@@ -1301,16 +1301,21 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
     prompt = (
         "A Rho events rep sent a Slack message to the events bot. Decide what they want.\n"
         f"The sender is known in Notion as: {who}. Today's date is {today}.\n"
-        'Return ONLY JSON: {"intent": "change"|"edit"|"question"|"none", "event_index": <int or '
-        'null>, "remove": [<names>], "add": [<names>], "changes": {"date": <YYYY-MM-DD or null>, '
-        '"city": <string or null>, "cost": <number or null>, "partner": <string or null>, '
-        '"invite_link": <string or null>, "event_name": <string or null>}, "answer": <string>}.\n'
+        'Return ONLY JSON: {"intent": "change"|"edit"|"question"|"feedback"|"none", '
+        '"event_index": <int or null>, "remove": [<names>], "add": [<names>], '
+        '"changes": {"date": <YYYY-MM-DD or null>, "city": <string or null>, '
+        '"cost": <number or null>, "partner": <string or null>, "invite_link": <string or null>, '
+        '"event_name": <string or null>}, "topic": <string or null>, "answer": <string>}.\n'
         "Intents:\n"
         "- \"change\": modify rep assignments for ONE event. Set event_index and fill remove/add.\n"
         "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
         "name). Set event_index and put ONLY the requested field(s) in 'changes'; leave the rest "
         "null. Use this for messages like 'change the date for X to 8-12' or 'rename Y to Z'.\n"
-        "- \"question\": they are ASKING about events or assignments (who is on an event, what "
+        "- \"feedback\": they are asking about PAST FEEDBACK / how prior events went (with a "
+        "partner, host, or format) — e.g. 'any feedback from prior events with Verci?', 'how did "
+        "the CADRE dinners go?'. Set 'topic' to the partner/host/format they're asking about "
+        "(e.g. 'Verci'). Leave other fields empty.\n"
+        "- \"question\": they are ASKING about events or ASSIGNMENTS (who is on an event, what "
         "someone is assigned to, how many, when, etc.). Put a concise Slack-formatted answer in "
         "'answer', computed ONLY from the UPCOMING EVENTS below; list events as "
         "'• <date> — <event>'. If nothing matches, say so plainly. Leave other fields empty.\n"
@@ -1617,6 +1622,26 @@ def _feedback_block(rows):
             bits.append(f"adjust next time: {r['adjust']}")
         out.append("- " + " | ".join(bits))
     return "\n".join(out)
+
+
+def answer_feedback_question(text, topic):
+    """Answer a 'how did past events with X go?' question from #events-feedback."""
+    rows = relevant_feedback(topic or "", topic or "")
+    if not rows:
+        if not fetch_all_feedback():                 # nothing readable at all
+            return ("I couldn't find any feedback to check — I may not have access to the "
+                    "#events-feedback channel yet (I need to be invited to it).")
+        label = f" for “{topic}”" if topic else ""
+        return f"I don't have any logged event feedback{label}."
+    out = ask_json(
+        "A teammate asked the events bot about PAST event feedback. Using ONLY the feedback "
+        "entries below, write a concise Slack-formatted answer (a short summary plus 2-4 bullet "
+        "highlights: partner/audience fit, lead quality, and any recurring praise or issues). If "
+        "the entries don't really address the question, say so plainly. Do not invent anything. "
+        "Return ONLY JSON {\"answer\": <string>}.\n\n"
+        f"QUESTION:\n{text}\n\nFEEDBACK ENTRIES:\n{_feedback_block(rows)}",
+        max_tokens=800)
+    return (out.get("answer") or "").strip() or f"Here's what I found:\n{_feedback_block(rows)}"
 
 
 _revenue_cache = {}               # term -> (text, timestamp)
@@ -2082,6 +2107,14 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
             log.info("answered assignment question from %s", user)
         else:
             log.info("question with no answer; staying silent")
+        return
+
+    # Answering a question about PAST FEEDBACK (from #events-feedback).
+    if intent == "feedback":
+        _bot_threads.add((channel, thread_ts))
+        answer = answer_feedback_question(text, parsed.get("topic"))
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+        log.info("answered feedback question from %s (topic=%r)", user, parsed.get("topic"))
         return
 
     # Editing a field of one event (date, city, cost, partner, invite, name).
