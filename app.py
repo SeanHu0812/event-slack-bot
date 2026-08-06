@@ -2433,8 +2433,9 @@ def on_reaction(event, client):
              reaction, user, channel, item.get("type"))
     if item.get("type") != "message":
         return
-    # 🗑️ an approver deletes one of the bot's own messages (any channel).
-    if reaction == DELETE_EMOJI and user in APPROVERS:
+    # 🗑️ anyone can delete one of the bot's own messages (any channel). Safe: Slack
+    # only lets chat.delete remove the bot's own messages, never anyone else's.
+    if reaction == DELETE_EMOJI:
         _bg(_delete_bot_message, client, channel, ts)
         return
     # 👀 on any #community-team message manually triggers an assessment.
