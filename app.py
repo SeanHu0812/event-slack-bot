@@ -1831,6 +1831,7 @@ def answer_feedback_question(text, topic):
 
 _revenue_cache = {}               # term -> (text, timestamp)
 _REVENUE_TTL = 900
+_last_snowflake_error = None      # last connection/query error message, for diagnostics
 
 
 # Events are Salesforce Campaigns in the warehouse: DIM_SALESFORCE_CAMPAIGN.CAMPAIGN_NAME
@@ -1891,18 +1892,22 @@ def snowflake_revenue(partner, event_type, city, event_name):
         return cached[0]
     binds = {"partner": partner or "", "event_type": event_type or "",
              "city": city or "", "term": term}
+    global _last_snowflake_error
+    _last_snowflake_error = None
     try:
         conn = _snowflake_connect()
-    except Exception:
+    except Exception as e:
         log.exception("snowflake connection failed")
+        _last_snowflake_error = str(e)[:300]
         return None
     try:
         cur = conn.cursor()
         cur.execute(sql, binds)
         cols = [c[0] for c in cur.description]
         rows = cur.fetchmany(25)
-    except Exception:
+    except Exception as e:
         log.exception("snowflake revenue query failed")
+        _last_snowflake_error = str(e)[:300]
         return None
     finally:
         conn.close()
@@ -1930,6 +1935,8 @@ def answer_revenue_question(text, topic):
                 "before I can pull how events performed.")
     rev = snowflake_revenue(topic or "", None, None, topic or "")
     if rev is None:
+        if _last_snowflake_error:
+            return f"I couldn't reach Snowflake — it returned:\n`{_last_snowflake_error}`"
         return "I couldn't reach Snowflake just now — try again in a moment."
     if rev.startswith("No comparable"):
         label = f" for “{topic}”" if topic else ""
