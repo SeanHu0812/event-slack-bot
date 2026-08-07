@@ -1382,6 +1382,23 @@ def _event_detail_line(e):
     return " | ".join(parts)
 
 
+def _linkify_events(answer, events):
+    """Ensure each event name in the answer is a Slack link to its invite page.
+    Deterministic: for every event that has an invite URL, wrap the first un-linked
+    occurrence of its exact name in <url|name>. Events without an invite are left
+    plain. Longest names first so a shorter name can't grab a longer one's text."""
+    named = [e for e in events if e.get("invite") and e.get("event")]
+    for e in sorted(named, key=lambda x: len(x["event"]), reverse=True):
+        name, url = e["event"], e["invite"]
+        if url in answer:                            # model already linked this one
+            continue
+        # Replace the name only when it isn't already the label/target of a link
+        # (not immediately preceded by '<' or '|').
+        pattern = re.compile(r"(?<![<|])" + re.escape(name))
+        answer = pattern.sub(lambda m: f"<{url}|{name}>", answer, count=1)
+    return answer
+
+
 def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
     """Answer any question about our events by searching the full calendar (matching
     on event name AND partner field, plus city/reps), narrowing by an optional date
@@ -1417,7 +1434,7 @@ def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
         max_tokens=1200)
     ans = (out.get("answer") or "").strip()
     if ans:
-        return ans
+        return _linkify_events(ans, shown)           # guarantee name -> invite links
     if not shown:                                    # genuinely nothing matched
         return "I couldn't find any events matching that."
     # The summarizer came back empty but we DO have matches — return them plainly.
