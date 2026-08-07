@@ -1407,10 +1407,12 @@ def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
         "year' etc. from the dates. Count precisely; for 'who went/attended', list the reps. If "
         f"the total count matters and the list is truncated, use the stated total ({total}). If "
         "the events don't answer the question, say so plainly. Never invent events. "
-        "When you name an event, render it as a Slack link to its invite page using the exact "
-        "syntax <URL|Event Name>, where URL is that event's `invite:` value; if an event has no "
-        "`invite:` value, use its plain name. Never print a bare/raw URL. Return ONLY "
-        "JSON {\"answer\": <string>}.\n\n"
+        "LINKS: make the event NAME itself the clickable link to its invite page — render it as "
+        "<URL|Event Name> using that event's `invite:` value. Do NOT add a separate 'Invite:' or "
+        "'Link:' field, and NEVER paste a URL as visible text; the only place a URL may appear is "
+        "inside <URL|Event Name>. If an event has no `invite:` value, use its plain name (don't "
+        "say 'not available'). Example line: '• Aug 11 – <https://lu.ma/x|Boston VC Dinner> — "
+        "reps: Drew Parten'. Return ONLY JSON {\"answer\": <string>}.\n\n"
         f"QUESTION:\n{text}\n\nEVENTS ({header}):\n" + "\n".join(lines),
         max_tokens=1200)
     ans = (out.get("answer") or "").strip()
@@ -2312,7 +2314,8 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
         _bot_threads.add((channel, thread_ts))
         answer = answer_event_question(text, parsed.get("search_terms"),
                                        parsed.get("date_from"), parsed.get("date_to"))
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer,
+                                unfurl_links=False, unfurl_media=False)
         log.info("answered event question from %s (terms=%s, %s..%s)", user,
                  parsed.get("search_terms"), parsed.get("date_from"), parsed.get("date_to"))
         return
