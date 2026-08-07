@@ -1376,10 +1376,18 @@ def _event_detail_line(e):
     return " | ".join(parts)
 
 
-def answer_event_question(text, terms, cap=150):
+def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
     """Answer any question about our events by searching the full calendar (matching
-    on event name AND partner field, plus city/reps) and reading full details."""
+    on event name AND partner field, plus city/reps), narrowing by an optional date
+    window, and reading full details."""
     matches = search_events(terms)
+    if date_from:
+        matches = [e for e in matches if e["date"] and e["date"] >= date_from]
+    if date_to:
+        matches = [e for e in matches if e["date"] and e["date"] <= date_to]
+    # For a time-window question, show earliest-first; otherwise newest-first.
+    if date_from or date_to:
+        matches = sorted(matches, key=lambda e: e["date"] or "")
     total = len(matches)
     shown = matches[:cap]
     lines = [_event_detail_line(e) for e in shown]
@@ -1396,7 +1404,18 @@ def answer_event_question(text, terms, cap=150):
         "JSON {\"answer\": <string>}.\n\n"
         f"QUESTION:\n{text}\n\nEVENTS ({header}):\n" + "\n".join(lines),
         max_tokens=1200)
-    return (out.get("answer") or "").strip() or "I couldn't find anything matching that."
+    ans = (out.get("answer") or "").strip()
+    if ans:
+        return ans
+    if not shown:                                    # genuinely nothing matched
+        return "I couldn't find any events matching that."
+    # The summarizer came back empty but we DO have matches — return them plainly.
+    out_lines = []
+    for e in shown[:30]:
+        reps = ", ".join(e["reps"]) if e["reps"] else "no reps yet"
+        city = f" ({e['city']})" if e.get("city") else ""
+        out_lines.append(f"• {e['date'] or '?'}{city} — {e['event']} — {reps}")
+    return "Here's what I found:\n" + "\n".join(out_lines)
 
 
 def parse_mention(text, requester_names, events, valid_opts, context=""):
@@ -1417,7 +1436,8 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         '"changes": {"date": <YYYY-MM-DD or null>, "city": <string or null>, '
         '"cost": <number or null>, "partner": <string or null>, "invite_link": <string or null>, '
         '"event_name": <string or null>}, "topic": <string or null>, '
-        '"search_terms": [<keywords>], "answer": <string>}.\n'
+        '"search_terms": [<keywords>], "date_from": <YYYY-MM-DD or null>, '
+        '"date_to": <YYYY-MM-DD or null>, "answer": <string>}.\n'
         "Intents:\n"
         "- \"change\": modify rep assignments for ONE event. Set event_index and fill remove/add.\n"
         "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
@@ -1435,7 +1455,9 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         "feedback or revenue. E.g. 'how many events with Mastercard?', 'who's attending the Fusion "
         "Fund event?', 'what events are next week?'. Put the entities in 'search_terms' "
         "(partner/host, event keywords, a city, or a person's name, e.g. ['Verci'] or ['Jason']); "
-        "use [] for a broad question with no entity. Leave 'answer' empty.\n"
+        "use [] for a broad question with no entity. For a TIME-SCOPED question ('next week', "
+        "'this month', 'in September', 'last year'), also set date_from and date_to (YYYY-MM-DD) "
+        "bounding that window relative to today; otherwise leave both null. Leave 'answer' empty.\n"
         "- \"none\": anything else (greetings, chit-chat, unrelated). All fields empty.\n"
         "When unsure between question, feedback, and revenue, choose \"question\".\n"
         "For both change and edit, set event_index to the matching event's index below (null if "
@@ -2278,9 +2300,11 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
     # Answering any question about our events — searches the FULL Notion calendar.
     if intent == "question":
         _bot_threads.add((channel, thread_ts))
-        answer = answer_event_question(text, parsed.get("search_terms"))
+        answer = answer_event_question(text, parsed.get("search_terms"),
+                                       parsed.get("date_from"), parsed.get("date_to"))
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
-        log.info("answered event question from %s (terms=%s)", user, parsed.get("search_terms"))
+        log.info("answered event question from %s (terms=%s, %s..%s)", user,
+                 parsed.get("search_terms"), parsed.get("date_from"), parsed.get("date_to"))
         return
 
     # Answering a question about PAST FEEDBACK (from #events-feedback).
