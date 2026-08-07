@@ -1852,6 +1852,31 @@ def _sf(name):
     return os.environ.get(name) or SNOWFLAKE_DEFAULTS.get(name)
 
 
+def _snowflake_connect():
+    """Open a Snowflake connection for the bot. Uses the PAT/password directly and
+    ignores interactive authenticators (Okta / external-browser), which can't work
+    headless. Tries PAT-as-password first, then the PROGRAMMATIC_ACCESS_TOKEN method."""
+    cred = os.environ.get("SNOWFLAKE_PASSWORD")
+    base = dict(account=os.environ["SNOWFLAKE_ACCOUNT"], user=os.environ["SNOWFLAKE_USER"],
+                warehouse=_sf("SNOWFLAKE_WAREHOUSE"), database=_sf("SNOWFLAKE_DATABASE"),
+                schema=_sf("SNOWFLAKE_SCHEMA"), role=_sf("SNOWFLAKE_ROLE"),
+                login_timeout=15, network_timeout=30)
+    authr = (os.environ.get("SNOWFLAKE_AUTHENTICATOR") or "").strip()
+    if authr and "okta" not in authr.lower() and authr.lower() != "externalbrowser":
+        kw = dict(base, authenticator=authr)          # explicit (e.g. oauth / key-pair)
+        kw["token" if (authr.lower() == "oauth" or "token" in authr.lower()) else "password"] = cred
+        return snowflake_connector.connect(**kw)
+    if authr:
+        log.warning("ignoring interactive SNOWFLAKE_AUTHENTICATOR=%r (unusable headless); "
+                    "using the token directly", authr)
+    try:                                              # PAT used in place of a password
+        return snowflake_connector.connect(**dict(base, password=cred))
+    except Exception:
+        log.warning("PAT-as-password failed; retrying with PROGRAMMATIC_ACCESS_TOKEN")
+        return snowflake_connector.connect(
+            **dict(base, authenticator="PROGRAMMATIC_ACCESS_TOKEN", token=cred))
+
+
 def snowflake_revenue(partner, event_type, city, event_name):
     """Per-event revenue from Snowflake (DIM_SALESFORCE_CAMPAIGN), matched by
     partner/event keyword. Returns a short text summary, or None when revenue isn't
@@ -1866,16 +1891,7 @@ def snowflake_revenue(partner, event_type, city, event_name):
     binds = {"partner": partner or "", "event_type": event_type or "",
              "city": city or "", "term": term}
     try:
-        conn = snowflake_connector.connect(
-            account=os.environ["SNOWFLAKE_ACCOUNT"],
-            user=os.environ["SNOWFLAKE_USER"],
-            password=os.environ.get("SNOWFLAKE_PASSWORD"),
-            authenticator=os.environ.get("SNOWFLAKE_AUTHENTICATOR"),
-            warehouse=_sf("SNOWFLAKE_WAREHOUSE"),
-            database=_sf("SNOWFLAKE_DATABASE"),
-            schema=_sf("SNOWFLAKE_SCHEMA"),
-            role=_sf("SNOWFLAKE_ROLE"),
-            login_timeout=15, network_timeout=30)
+        conn = _snowflake_connect()
     except Exception:
         log.exception("snowflake connection failed")
         return None
