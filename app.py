@@ -1400,7 +1400,10 @@ def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
         f"Slack-formatted. Today is {date.today().isoformat()}, so resolve 'this week'/'last "
         "year' etc. from the dates. Count precisely; for 'who went/attended', list the reps. If "
         f"the total count matters and the list is truncated, use the stated total ({total}). If "
-        "the events don't answer the question, say so plainly. Never invent events. Return ONLY "
+        "the events don't answer the question, say so plainly. Never invent events. "
+        "When you name an event, render it as a Slack link to its invite page using the exact "
+        "syntax <URL|Event Name>, where URL is that event's `invite:` value; if an event has no "
+        "`invite:` value, use its plain name. Never print a bare/raw URL. Return ONLY "
         "JSON {\"answer\": <string>}.\n\n"
         f"QUESTION:\n{text}\n\nEVENTS ({header}):\n" + "\n".join(lines),
         max_tokens=1200)
@@ -1414,7 +1417,8 @@ def answer_event_question(text, terms, date_from=None, date_to=None, cap=150):
     for e in shown[:30]:
         reps = ", ".join(e["reps"]) if e["reps"] else "no reps yet"
         city = f" ({e['city']})" if e.get("city") else ""
-        out_lines.append(f"• {e['date'] or '?'}{city} — {e['event']} — {reps}")
+        name = f"<{e['invite']}|{e['event']}>" if e.get("invite") else e["event"]
+        out_lines.append(f"• {e['date'] or '?'}{city} — {name} — {reps}")
     return "Here's what I found:\n" + "\n".join(out_lines)
 
 
