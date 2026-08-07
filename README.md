@@ -40,8 +40,10 @@ assessment per proposal thread. Each aspect degrades gracefully: if the feedback
 shared with the integration, or Snowflake isn't configured, that aspect is skipped and the
 score leans on the others.
 
-**Triggers.** The bot assesses automatically when it detects a new proposal in the channel.
-Anyone can also react **👀 (`:eyes:`)** on any message to assess it on demand.
+**Triggers.** The bot assesses automatically when it detects a new proposal in an assess
+channel (#community-team and **#event-bot-testing**, for safe testing — approvals that create
+Notion pages remain #community-team only). Anyone can also react **👀 (`:eyes:`)** on any
+message in those channels to assess it on demand.
 
 **Self-learning.** @-mention Event-Bot in an assessment thread to give it insight — e.g.
 "@Event-Bot score open mixers lower" or "@Event-Bot this partner always over-promises."
@@ -169,6 +171,10 @@ classifies each message as a **question**, a **change**, an **edit**, or neither
   dinners go?") → the bot searches **#events-feedback** for matching submissions and summarizes
   what we learned (partner/audience fit, lead quality, recurring notes). If it can't read the
   channel, it says so (a hint it needs to be invited).
+- **Revenue question** ("how did the Mastercard dinner do?", "how much revenue from Verci
+  events?") → the bot queries **Snowflake** (`DIM_SALESFORCE_CAMPAIGN`, matched by event/partner
+  name) and reports contacts, won opportunities, and won $. Needs Snowflake configured (below);
+  otherwise it says revenue isn't connected yet.
 - **Edit** ("change the date for VC Dinner w/ Mastercard to 8-12", "rename X to Y", "set the
   cost for the CADRE dinner to $4k") → the bot updates the matching event's field(s) in Notion
   (`Date`, `City`, `Estimated Cost`, `Partner`, `Invite Link`, or the event name). A **date**

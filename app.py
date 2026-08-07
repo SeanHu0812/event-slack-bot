@@ -34,6 +34,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("events-bot")
 
 CHANNEL       = "C08K7K31ML6"    # #community-team
+TESTING_CHANNEL = "C0BKFEW8X8A"  # #event-bot-testing (private) — assessments run here too
+# Channels where the bot auto-assesses proposals + accepts 👀 / assessment feedback.
+# Approvals (which create real Notion pages) remain #community-team only.
+ASSESS_CHANNELS = {CHANNEL, TESTING_CHANNEL}
 APPROVE_EMOJI = "approved"       # Slack sends the bare name, no colons
 CONFIRM_EMOJI = "white_check_mark"   # ✅ used to confirm an over-budget event
 DELETE_EMOJI = "wastebasket"     # 🗑️ an approver reacts to delete one of the bot's own messages
@@ -1406,7 +1410,7 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
     prompt = (
         "A Rho events rep sent a Slack message to the events bot. Decide what they want.\n"
         f"The sender is known in Notion as: {who}. Today's date is {today}.\n"
-        'Return ONLY JSON: {"intent": "change"|"edit"|"question"|"feedback"|"none", '
+        'Return ONLY JSON: {"intent": "change"|"edit"|"question"|"feedback"|"revenue"|"none", '
         '"event_index": <int or null>, "remove": [<names>], "add": [<names>], '
         '"changes": {"date": <YYYY-MM-DD or null>, "city": <string or null>, '
         '"cost": <number or null>, "partner": <string or null>, "invite_link": <string or null>, '
@@ -1417,10 +1421,13 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
         "name). Set event_index and put ONLY the requested field(s) in 'changes'; leave the rest "
         "null. Use this for messages like 'change the date for X to 8-12' or 'rename Y to Z'.\n"
-        "- \"feedback\": they are asking about PAST FEEDBACK / how prior events went (with a "
-        "partner, host, or format) — e.g. 'any feedback from prior events with Verci?', 'how did "
-        "the CADRE dinners go?'. Set 'topic' to the partner/host/format they're asking about "
-        "(e.g. 'Verci'). Leave other fields empty.\n"
+        "- \"feedback\": they are asking about PAST FEEDBACK / how prior events went QUALITATIVELY "
+        "(rep feedback, crowd quality, vibe) — e.g. 'any feedback from prior events with Verci?'. "
+        "Set 'topic' to the partner/host/format. Leave other fields empty.\n"
+        "- \"revenue\": they are asking how an event or partner PERFORMED FINANCIALLY — revenue, "
+        "opportunities/deals won, deposits, pipeline, ROI — e.g. 'how did the Mastercard dinner "
+        "do?', 'how much revenue from Verci events?', 'how many deals did X drive?'. Set 'topic' "
+        "to the event or partner name. Leave other fields empty.\n"
         "- \"question\": they are ASKING anything about our events, past OR upcoming (who "
         "attended/is assigned, how many events with a partner, when we last did X, totals, etc.). "
         "Put the key entities to look up in 'search_terms' — partner/host names, event-name "
@@ -1845,6 +1852,28 @@ def revenue_configured():
                 and os.environ.get("SNOWFLAKE_PASSWORD"))
 
 
+def answer_revenue_question(text, topic):
+    """Answer 'how did event/partner X do?' from Snowflake campaign revenue."""
+    if not revenue_configured():
+        return ("Revenue data isn't connected yet — I need Snowflake credentials (a PAT) set up "
+                "before I can pull how events performed.")
+    rev = snowflake_revenue(topic or "", None, None, topic or "")
+    if rev is None:
+        return "I couldn't reach Snowflake just now — try again in a moment."
+    if rev.startswith("No comparable"):
+        label = f" for “{topic}”" if topic else ""
+        return f"I don't see any revenue tied to an event or partner{label} in Snowflake."
+    out = ask_json(
+        "A teammate asked how a Rho event (or events with a partner) performed financially. Using "
+        "ONLY the Salesforce campaign rows below (one per event; dollar amounts are USD), write a "
+        "concise Slack-formatted answer: name the event(s) and report contacts, # won "
+        "opportunities, and won $ (format like $1.2M / $250K). If several events match, summarize "
+        "the notable ones plus the total. Note that recent events may show $0 (deals haven't "
+        "closed yet). Don't invent anything. Return ONLY JSON {\"answer\": <string>}.\n\n"
+        f"QUESTION:\n{text}\n\nCAMPAIGN ROWS:\n{rev}", max_tokens=900)
+    return (out.get("answer") or "").strip() or f"Here's what I found:\n{rev}"
+
+
 def assess_proposal(fields, text):
     """Score a proposal 1-10 across business-fit + feedback (+ revenue when Snowflake
     is configured). Returns the parsed JSON assessment, or {} on failure."""
@@ -1924,10 +1953,10 @@ def assessment_text(a):
     return "\n".join(lines)
 
 
-def already_assessed(client, ts):
+def already_assessed(client, channel, ts):
     """True if the bot has already posted an assessment in this proposal's thread."""
     try:
-        msgs = client.conversations_replies(channel=CHANNEL, ts=ts, limit=50)["messages"]
+        msgs = client.conversations_replies(channel=channel, ts=ts, limit=50)["messages"]
     except Exception:
         return False
     return any((m.get("bot_id") or m.get("user") == BOT_USER_ID)
@@ -2141,7 +2170,7 @@ def handle_assessment_feedback(client, channel, thread_ts, msg_ts, user, text):
 
 def _is_assessment_thread(client, channel, thread_ts):
     """True if this thread is one where the bot posted an assessment."""
-    if channel != CHANNEL:
+    if channel not in ASSESS_CHANNELS:
         return False
     if (channel, thread_ts) in _assessment_threads:
         return True
@@ -2257,6 +2286,14 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
         answer = answer_feedback_question(text, parsed.get("topic"))
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
         log.info("answered feedback question from %s (topic=%r)", user, parsed.get("topic"))
+        return
+
+    # Answering a question about how an event/partner performed (revenue, from Snowflake).
+    if intent == "revenue":
+        _bot_threads.add((channel, thread_ts))
+        answer = answer_revenue_question(text, parsed.get("topic"))
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+        log.info("answered revenue question from %s (topic=%r)", user, parsed.get("topic"))
         return
 
     # Editing a field of one event (date, city, cost, partner, invite, name).
@@ -2459,9 +2496,9 @@ def on_reaction(event, client):
     if reaction == DELETE_EMOJI:
         _bg(_delete_bot_message, client, channel, ts)
         return
-    # 👀 on any #community-team message manually triggers an assessment.
-    if reaction == ASSESS_EMOJI and channel == CHANNEL:
-        _bg(_assess_message, client, ts)
+    # 👀 in an assess channel manually triggers an assessment.
+    if reaction == ASSESS_EMOJI and channel in ASSESS_CHANNELS:
+        _bg(_assess_message, client, channel, ts)
         return
     # Event approvals / over-budget confirmations in #community-team.
     if channel != CHANNEL or user not in APPROVERS:
@@ -2508,29 +2545,29 @@ def on_message(event, client):
     # @mentions and DMs. (This also covers replies under the weekly rundown.)
     if thread_ts:
         return
-    # Top-level community-channel message — proposal heads-up + assessment.
-    if channel != CHANNEL:
+    # Top-level message in an assess channel — proposal heads-up + assessment.
+    if channel not in ASSESS_CHANNELS:
         return
     if len(text) < ASSESS_MIN_LEN:                # skip chatter
         return
-    _bg(_handle_new_proposal, client, ts, text)
+    _bg(_handle_new_proposal, client, channel, ts, text)
 
 
-def _post_assessment(client, ts, fields, text):
+def _post_assessment(client, channel, ts, fields, text):
     """Assess a proposal and post it in-thread, unless one is already there."""
-    if already_assessed(client, ts):
+    if already_assessed(client, channel, ts):
         return
     a = assess_proposal(fields, text)
     if a and a.get("overall") is not None:
-        client.chat_postMessage(channel=CHANNEL, thread_ts=ts, text=assessment_text(a))
-        _assessment_threads.add((CHANNEL, ts))    # so thread replies route to learning
-        log.info("posted assessment %s (%s) for %s",
-                 a.get("overall"), a.get("verdict"), ts)
+        client.chat_postMessage(channel=channel, thread_ts=ts, text=assessment_text(a))
+        _assessment_threads.add((channel, ts))    # so thread replies route to learning
+        log.info("posted assessment %s (%s) for %s in %s",
+                 a.get("overall"), a.get("verdict"), ts, channel)
 
 
-def _handle_new_proposal(client, ts, text):
-    """A top-level #community-team message. Parse once; if it's a proposal, post a
-    budget heads-up (when over threshold) and a 1-10 assessment in its thread."""
+def _handle_new_proposal(client, channel, ts, text):
+    """A top-level message in an assess channel. Parse once; if it's a proposal, post
+    a budget heads-up (when over threshold) and a 1-10 assessment in its thread."""
     fields = parse_proposal(text)
     if not fields.get("event"):
         return
@@ -2539,24 +2576,24 @@ def _handle_new_proposal(client, ts, text):
         try:
             status = budget_status(fields)
             if status:
-                client.chat_postMessage(channel=CHANNEL, thread_ts=ts,
+                client.chat_postMessage(channel=channel, thread_ts=ts,
                                         text=pre_approval_text(status))
                 log.info("posted pre-approval %s warning for %s", status["band"], ts)
         except Exception:
             log.exception("budget heads-up failed for %s", ts)
     try:
-        _post_assessment(client, ts, fields, text)
+        _post_assessment(client, channel, ts, fields, text)
     except Exception:
         log.exception("assessment failed for %s", ts)
 
 
-def _assess_message(client, ts):
+def _assess_message(client, channel, ts):
     """Manual 👀 trigger: fetch the reacted message and assess it if it's a proposal."""
-    if already_assessed(client, ts):
+    if already_assessed(client, channel, ts):
         return
     try:
         msgs = client.conversations_history(
-            channel=CHANNEL, latest=ts, inclusive=True, limit=1).get("messages", [])
+            channel=channel, latest=ts, inclusive=True, limit=1).get("messages", [])
     except Exception:
         log.exception("could not fetch reacted message %s", ts)
         return
@@ -2568,7 +2605,7 @@ def _assess_message(client, ts):
         log.info("👀 on %s but it isn't an event proposal; skipping", ts)
         return
     try:
-        _post_assessment(client, ts, fields, text)
+        _post_assessment(client, channel, ts, fields, text)
     except Exception:
         log.exception("manual assessment failed for %s", ts)
 
