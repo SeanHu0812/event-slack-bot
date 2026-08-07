@@ -1869,12 +1869,13 @@ def _snowflake_connect():
     if authr:
         log.warning("ignoring interactive SNOWFLAKE_AUTHENTICATOR=%r (unusable headless); "
                     "using the token directly", authr)
-    try:                                              # PAT used in place of a password
+    # A Programmatic Access Token is used in place of a password (default authenticator).
+    try:
         return snowflake_connector.connect(**dict(base, password=cred))
-    except Exception:
-        log.warning("PAT-as-password failed; retrying with PROGRAMMATIC_ACCESS_TOKEN")
-        return snowflake_connector.connect(
-            **dict(base, authenticator="PROGRAMMATIC_ACCESS_TOKEN", token=cred))
+    except Exception as e:
+        log.warning("Snowflake auth failed for user=%s account=%s role=%s: %s",
+                    base["user"], base["account"], base["role"], e)
+        raise
 
 
 def snowflake_revenue(partner, event_type, city, event_name):
