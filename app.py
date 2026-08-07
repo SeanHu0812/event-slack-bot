@@ -1772,14 +1772,32 @@ _revenue_cache = {}               # term -> (text, timestamp)
 _REVENUE_TTL = 900
 
 
+# Events are Salesforce Campaigns in the warehouse: DIM_SALESFORCE_CAMPAIGN.CAMPAIGN_NAME
+# is the event name (e.g. "7/28/26 - NY Rho Mastercard VC Dinner") with per-event revenue
+# rolled up. We match by event/partner keyword in the campaign name. Overridable via env.
+REVENUE_DEFAULT_SQL = (
+    "SELECT CAMPAIGN_NAME, CAMPAIGN_START_DATE, CAMPAIGN_NUMBER_OF_CONTACTS, "
+    "CAMPAIGN_NUMBER_OF_OPPORTUNITIES, CAMPAIGN_NUMBER_OF_WON_OPPORTUNITIES, "
+    "CAMPAIGN_AMOUNT_WON_OPPORTUNITIES, CAMPAIGN_AMOUNT_ALL_OPPORTUNITIES "
+    "FROM analytics_dbt.BASE.DIM_SALESFORCE_CAMPAIGN "
+    "WHERE CAMPAIGN_TYPE ILIKE '%event%' AND CAMPAIGN_NAME ILIKE '%' || %(term)s || '%' "
+    "ORDER BY CAMPAIGN_START_DATE DESC LIMIT 25")
+# Connection defaults discovered from the workspace (all overridable via env).
+SNOWFLAKE_DEFAULTS = {"SNOWFLAKE_WAREHOUSE": "COMPUTE_WH", "SNOWFLAKE_DATABASE": "analytics_dbt",
+                      "SNOWFLAKE_SCHEMA": "BASE", "SNOWFLAKE_ROLE": "SNOWFLAKE_OKTA_GTM_MARKETING"}
+
+
+def _sf(name):
+    return os.environ.get(name) or SNOWFLAKE_DEFAULTS.get(name)
+
+
 def snowflake_revenue(partner, event_type, city, event_name):
-    """Past revenue tied to this partner/format, from Snowflake. Fully driven by
-    env: the SNOWFLAKE_* connection vars plus REVENUE_SQL, a SELECT that uses the
-    named binds %(partner)s %(event_type)s %(city)s %(term)s. Returns a short text
-    summary of the rows, or None when revenue isn't configured / is unavailable."""
-    sql = os.environ.get("REVENUE_SQL")
-    if not (_SNOWFLAKE_AVAILABLE and sql and os.environ.get("SNOWFLAKE_ACCOUNT")):
+    """Per-event revenue from Snowflake (DIM_SALESFORCE_CAMPAIGN), matched by
+    partner/event keyword. Returns a short text summary, or None when revenue isn't
+    configured / is unavailable. Query is REVENUE_SQL (env) or REVENUE_DEFAULT_SQL."""
+    if not revenue_configured():
         return None
+    sql = os.environ.get("REVENUE_SQL") or REVENUE_DEFAULT_SQL
     term = (partner or event_name or "").strip()
     cached = _revenue_cache.get(term)
     if cached and (time.time() - cached[1]) < _REVENUE_TTL:
@@ -1792,10 +1810,10 @@ def snowflake_revenue(partner, event_type, city, event_name):
             user=os.environ["SNOWFLAKE_USER"],
             password=os.environ.get("SNOWFLAKE_PASSWORD"),
             authenticator=os.environ.get("SNOWFLAKE_AUTHENTICATOR"),
-            warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE"),
-            database=os.environ.get("SNOWFLAKE_DATABASE"),
-            schema=os.environ.get("SNOWFLAKE_SCHEMA"),
-            role=os.environ.get("SNOWFLAKE_ROLE"),
+            warehouse=_sf("SNOWFLAKE_WAREHOUSE"),
+            database=_sf("SNOWFLAKE_DATABASE"),
+            schema=_sf("SNOWFLAKE_SCHEMA"),
+            role=_sf("SNOWFLAKE_ROLE"),
             login_timeout=15, network_timeout=30)
     except Exception:
         log.exception("snowflake connection failed")
@@ -1815,13 +1833,16 @@ def snowflake_revenue(partner, event_type, city, event_name):
     else:
         text = "\n".join(", ".join(f"{c}={v}" for c, v in zip(cols, row)) for row in rows)
     _revenue_cache[term] = (text, time.time())
+    log.info("snowflake revenue for %r: %d row(s)", term, len(rows))
     return text
 
 
 def revenue_configured():
-    """True when the Snowflake revenue aspect is wired up (lib + creds + query)."""
+    """True when Snowflake revenue is wired up: the connector lib plus an account
+    and a credential (a PAT or password) in the environment. The query and the
+    warehouse/db/schema/role have sensible defaults, so only the credential is required."""
     return bool(_SNOWFLAKE_AVAILABLE and os.environ.get("SNOWFLAKE_ACCOUNT")
-                and os.environ.get("REVENUE_SQL"))
+                and os.environ.get("SNOWFLAKE_PASSWORD"))
 
 
 def assess_proposal(fields, text):
