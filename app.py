@@ -1286,11 +1286,14 @@ def upcoming_events_for_change():
         name = _plain(pr["Event"]["title"]).strip()
         if not name or name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
             continue
+        city = (pr.get("City", {}).get("select") or {}).get("name")
+        if city == "Holiday":                    # holidays / office closures / OOO — not events
+            continue
         d = (pr.get("Date") or {}).get("date") or {}
         if not d.get("start"):
             continue
         evs.append({"id": p["id"], "event": name, "date": d["start"][:10],
-                    "city": (pr.get("City", {}).get("select") or {}).get("name"),
+                    "city": city,
                     "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])]})
     return evs
 
@@ -1319,11 +1322,14 @@ def fetch_all_events():
                 name = _plain(pr["Event"]["title"]).strip()
                 if not name or name.upper().startswith("HOLD") or name.upper().startswith("[HOLD"):
                     continue
+                city = (pr.get("City", {}).get("select") or {}).get("name")
+                if city == "Holiday":            # holidays / office closures / OOO — not events
+                    continue
                 d = (pr.get("Date") or {}).get("date") or {}
                 evs.append({
                     "event": name,
                     "date": (d.get("start") or "")[:10],
-                    "city": (pr.get("City", {}).get("select") or {}).get("name"),
+                    "city": city,
                     "partner": _plain(pr.get("Partner", {}).get("rich_text")),
                     "reps": [o["name"] for o in pr.get("Reps", {}).get("multi_select", [])],
                     "venue": _plain(pr.get("Venue", {}).get("rich_text")),
