@@ -1401,7 +1401,9 @@ def answer_event_question(text, terms, cap=150):
 
 def parse_mention(text, requester_names, events, valid_opts, context=""):
     """Classify a rep's message to the bot and produce response data:
-    {intent: change|edit|question|none, event_index, remove[], add[], changes{}, answer}."""
+    {intent: change|edit|question|feedback|revenue|none, event_index, remove[], add[],
+    changes{}, topic, search_terms[], answer}. 'question' (Notion calendar) is the default
+    for event lookups; 'revenue' (Snowflake) fires only on explicit financial-performance asks."""
     today = date.today().isoformat()
     lines = [f"{i}: {e['date']} | {e.get('city') or '?'} | {e['event']} | "
              f"reps: {', '.join(e['reps']) or 'none'}" for i, e in enumerate(events)]
@@ -1421,20 +1423,21 @@ def parse_mention(text, requester_names, events, valid_opts, context=""):
         "- \"edit\": modify a FIELD of ONE event (its date, city, cost, partner, invite link, or "
         "name). Set event_index and put ONLY the requested field(s) in 'changes'; leave the rest "
         "null. Use this for messages like 'change the date for X to 8-12' or 'rename Y to Z'.\n"
-        "- \"feedback\": they are asking about PAST FEEDBACK / how prior events went QUALITATIVELY "
-        "(rep feedback, crowd quality, vibe) — e.g. 'any feedback from prior events with Verci?'. "
-        "Set 'topic' to the partner/host/format. Leave other fields empty.\n"
-        "- \"revenue\": they are asking how an event or partner PERFORMED FINANCIALLY — revenue, "
-        "opportunities/deals won, deposits, pipeline, ROI — e.g. 'how did the Mastercard dinner "
-        "do?', 'how much revenue from Verci events?', 'how many deals did X drive?'. Set 'topic' "
-        "to the event or partner name. Leave other fields empty.\n"
-        "- \"question\": they are ASKING anything about our events, past OR upcoming (who "
-        "attended/is assigned, how many events with a partner, when we last did X, totals, etc.). "
-        "Put the key entities to look up in 'search_terms' — partner/host names, event-name "
-        "keywords, a city, and/or a person's name (e.g. ['Verci'] or ['Jason']). Use [] only for "
-        "a broad question with no specific entity (e.g. 'how many events did we do this year'). "
-        "Leave 'answer' empty — the answer is computed separately from the full calendar.\n"
+        "- \"feedback\": ONLY when they explicitly ask about qualitative FEEDBACK / reviews of past "
+        "events (rep comments, crowd quality, vibe) — e.g. 'any feedback from events with Verci?'. "
+        "Set 'topic'. NOT for counts, attendance, dates, or logistics.\n"
+        "- \"revenue\": ONLY when they explicitly ask about FINANCIAL performance — using words "
+        "like revenue, deals/opportunities won, deposits, pipeline, ROI, or dollars — e.g. 'how "
+        "much revenue did the Mastercard dinner drive?', 'how many DEALS from Verci events?'. Set "
+        "'topic'. Do NOT use revenue for counting events, who attended, or when an event is.\n"
+        "- \"question\" (THE DEFAULT for anything about our events): finding or counting events, "
+        "who attended / is assigned, when/where, history, totals — anything that isn't explicitly "
+        "feedback or revenue. E.g. 'how many events with Mastercard?', 'who's attending the Fusion "
+        "Fund event?', 'what events are next week?'. Put the entities in 'search_terms' "
+        "(partner/host, event keywords, a city, or a person's name, e.g. ['Verci'] or ['Jason']); "
+        "use [] for a broad question with no entity. Leave 'answer' empty.\n"
         "- \"none\": anything else (greetings, chit-chat, unrelated). All fields empty.\n"
+        "When unsure between question, feedback, and revenue, choose \"question\".\n"
         "For both change and edit, set event_index to the matching event's index below (null if "
         "unclear/ambiguous); match the event by name sensibly (partial/reworded names are fine).\n"
         "Edit rules:\n"
