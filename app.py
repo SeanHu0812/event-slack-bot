@@ -2440,38 +2440,30 @@ def handle_mention(client, channel, thread_ts, msg_ts, user, text, rundown=False
 
     needs_replacement = bool(removed) and not add  # dropped with no named replacement
 
-    # --- User-facing response FIRST (keep it snappy) ---
-    if is_rundown:
-        edit_rundowns(client)                      # the rundown edit is the feedback here
-        if needs_replacement:
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts,
-                                    text=replacement_prompt(removed, ev))
+    # --- Confirmation ALWAYS (plain text, no @-mentions/pings) — posted first ---
+    parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
+    if removed:
+        parts.append("Removed: " + ", ".join(removed))
+    if add:
+        parts.append("Added: " + ", ".join(add))
+    if needs_replacement:
+        parts.append("")
+        parts.append(replacement_prompt(removed, ev))
     else:
-        # @mention / DM: a plain-text confirmation — no @-mentions, no pings.
-        parts = [f":white_check_mark: Updated *{ev['event']}* ({fmt_day(ev['date'])})."]
-        if removed:
-            parts.append("Removed: " + ", ".join(removed))
-        if add:
-            parts.append("Added: " + ", ".join(add))
-        if needs_replacement:
-            parts.append("")
-            parts.append(replacement_prompt(removed, ev))
-        else:
-            parts.append("Reps now: " + (", ".join(new) or "none"))
-        if invalid:
-            parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
+        parts.append("Reps now: " + (", ".join(new) or "none"))
+    if invalid:
+        parts.append(f"Couldn't find in the rep list, skipped: {', '.join(invalid)}")
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(parts))
 
     # --- Slower side-effects AFTER the response (user isn't blocked on these) ---
     try:
         update_calendar_guests(ev["id"], new)      # keep the gcal invite in sync (no email)
     except Exception:
         log.exception("calendar guest sync failed for %s", ev["id"])
-    if not is_rundown:                             # rundown path already edited above
-        try:
-            edit_rundowns(client)
-        except Exception:
-            log.exception("rundown refresh failed")
+    try:
+        edit_rundowns(client)                      # keep the posted rundowns in sync
+    except Exception:
+        log.exception("rundown refresh failed")
     for r in add:                                  # DM newly-assigned reps their lead list
         try:
             send_lead_list(client, r, ev["event"], ev.get("invite"))
