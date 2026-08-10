@@ -101,21 +101,31 @@ and posts a spending report
 ephemeral message visible only to you.
 
 ### Weekly rep-assignment rundown
-Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) **NYC**
-events from Notion and:
-- **Always posts the rundown** (events grouped by day, each as
-  `[Event](invite link) - @rep @rep`) to the channels in `RUNDOWN_CHANNELS`. The message
-  ends with "Can no longer make it to an event? Tag me and let me know. Thanks!"
-- If any event is **missing reps**, it also DMs Sean (`REPS_ALERT_USER`) an FYI listing them
-  (with Notion links) — once per week. It's a heads-up, not a gate; the rundown posts either
-  way, and assigning the reps updates the message.
+Every **Monday 10:00 America/New_York**, the bot reads this week's (Mon–Sun) events from
+Notion and posts a **per-city rundown** (events grouped by day, each as
+`[Event](invite link) - @rep @rep`, ending with "Can no longer make it to an event? Tag me
+and let me know. Thanks!"). Routing (`RUNDOWN_ROUTING`):
+
+| Rundown | Channels |
+|---|---|
+| **NYC** | `#gtm-nyc`, `#qualifiers-cross-department` |
+| **Boston** | `#gtm-boston`, `#qualifiers-cross-department` |
+
+So `#qualifiers-cross-department` receives both cities' rundowns as separate messages. Add a
+city by extending `RUNDOWN_ROUTING`. (Channel IDs are stable across Slack renames, e.g.
+`#ny-vc-squad`→`#gtm-nyc`, `#boston-vc-squad`→`#gtm-boston`.)
+
+- If any event (any city) is **missing reps**, the bot DMs Sean (`REPS_ALERT_USER`) one FYI
+  listing them with their city — once per week. It's a heads-up, not a gate.
 
 The trigger fires on the send day at or after 10:00 ET (`RUNDOWN_WEEKDAY`, 0=Mon), so a
 republish later in the day still sends that day rather than skipping the week.
 
-Before posting, the bot scans the channels for a rundown already sent this week and skips
-if found — so a restart/republish (which resets the in-memory schedule flag) can't cause a
-duplicate post. The missing-reps FYI is likewise not re-sent if one already went out this week.
+Before posting, the bot checks each channel for that city's rundown already sent this week and
+skips it there — so a restart/republish can't cause a duplicate. The missing-reps FYI is
+likewise not re-sent if one already went out this week. Editing a rundown does **not**
+re-notify already-tagged reps — only a newly added rep is pinged — which is why changes edit
+in place rather than reposting. (Only NYC events are mirrored to the New York Event Calendar.)
 Editing the rundown does **not** re-notify already-tagged reps — only a newly added rep is
 pinged — which is why changes edit in place rather than reposting.
 

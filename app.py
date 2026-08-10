@@ -61,9 +61,18 @@ VALID_CITIES = {"Atlanta", "Austin", "Boston", "Chicago", "Holiday", "LA/El Segu
 # Weekly rep-assignment rundown. Sent Mondays 10:00 ET, covering the current week.
 RUNDOWN_TZ = ZoneInfo("America/New_York")
 RUNDOWN_WEEKDAY = 0                      # 0=Mon .. 4=Fri — the day the rundown is sent
-RUNDOWN_CITY = "NYC"                     # scope: NYC only for now
-RUNDOWN_HEADER = "_Events this week in NYC_ :statue_of_liberty:"
-RUNDOWN_SENTINEL = "Events this week in NYC"   # to recognize a rundown message
+RUNDOWN_CITY = "NYC"                     # default city for the shared this-week helpers
+# Per-city routing: each city's weekly rundown is posted to these channels (bot must
+# be a member of each). #qualifiers-cross-department gets both cities.
+GTM_NYC     = "C077WPGU528"             # #gtm-nyc (was #ny-vc-squad)
+GTM_BOSTON  = "C08ET0LRBSB"             # #gtm-boston (was #boston-vc-squad / "#boston-gtm")
+QUALIFIERS  = "C08KPMCU6P9"             # #qualifiers-cross-department (private)
+RUNDOWN_ROUTING = {
+    "NYC":    [GTM_NYC, QUALIFIERS],
+    "Boston": [GTM_BOSTON, QUALIFIERS],
+}
+RUNDOWN_CITIES = list(RUNDOWN_ROUTING)
+RUNDOWN_EMOJI = {"NYC": ":statue_of_liberty:", "Boston": ":bean:"}
 RUNDOWN_REPLY_LINE = "Can no longer make it to an event? Tag me and let me know. Thanks!"
 _rundown_msgs = set()                    # (channel, ts) of the latest rundown posts
 
@@ -72,10 +81,6 @@ CAL_SOURCE = "sean.hu@rho.co"            # personal calendar events are cloned F
 CAL_TARGET = ("c_a6779362659cf757210d14e15b7010a789e7c861a40c61957bb120527c5d550a"
               "@group.calendar.google.com")   # New York Event Calendar
 ENRICHMENT_FOLDER_ID = "1pgMUAiBOOVFMleeGuPSFKi5-IXyjNpCB"   # Drive: Enrichment OUTPUT (lead lists)
-# Channel IDs to post the rundown to (bot must be invited to each).
-# Defaults to #ny-vc-squad and #qualifiers-across-department; override with the env var.
-RUNDOWN_CHANNELS = [c.strip() for c in os.environ.get(
-    "RUNDOWN_CHANNELS", "C077WPGU528,C08KPMCU6P9").split(",") if c.strip()]
 REPS_ALERT_USER = "U0BER9VC6NA"          # Sean — DMed (FYI) when events are missing reps
 REPS_REMINDER_SENTINEL = "Reps assignment are missing"
 MY_EVENTS_HORIZON_DAYS = 60              # how far ahead /my-event looks
@@ -572,29 +577,38 @@ def _plain(rich):
     return "".join(t.get("plain_text", "") for t in (rich or []))
 
 
-_week_cache = None                               # (fetched_monotonic, events)
+_week_cache = {}                                 # city -> (fetched_monotonic, events)
 _WEEK_TTL = 20                                   # short: dedupes repeated reads within one action
 
 
 def invalidate_week_cache():
     """Drop the events caches — call right after any Notion write so the next read
     reflects the change (e.g. the rundown edit after a rep change, or Q&A)."""
-    global _week_cache, _all_events_cache
-    _week_cache = None
+    global _all_events_cache
+    _week_cache.clear()
     _all_events_cache = None
 
 
-def fetch_week_events():
-    """This week's NYC events (HOLD placeholders excluded), sorted by date.
-    Cached briefly so a single change doesn't re-query Notion 2-3 times."""
-    global _week_cache
-    if _week_cache and time.monotonic() - _week_cache[0] < _WEEK_TTL:
-        return _week_cache[1]
+def rundown_header(city):
+    return f"_Events this week in {city}_ {RUNDOWN_EMOJI.get(city, '')}".rstrip()
+
+
+def rundown_sentinel(city):
+    """Substring that identifies a given city's rundown message in a channel."""
+    return f"Events this week in {city}"
+
+
+def fetch_week_events(city=RUNDOWN_CITY):
+    """This week's events for one city (HOLD placeholders excluded), sorted by date.
+    Cached briefly per city so a single change doesn't re-query Notion 2-3 times."""
+    c = _week_cache.get(city)
+    if c and time.monotonic() - c[0] < _WEEK_TTL:
+        return c[1]
     start, end = week_range()
     r = notion.data_sources.query(
         data_source_id=data_source_id(),
         filter={"and": [
-            {"property": "City", "select": {"equals": RUNDOWN_CITY}},
+            {"property": "City", "select": {"equals": city}},
             {"property": "Date", "date": {"on_or_after": start}},
             {"property": "Date", "date": {"on_or_before": end}},
         ]},
@@ -612,12 +626,13 @@ def fetch_week_events():
             "id": page["id"],
             "event": name,
             "date": d["start"][:10],
+            "city": city,
             "invite": first_url(_plain(props.get("Invite Link", {}).get("rich_text"))),
             "reps": [o["name"] for o in props.get("Reps", {}).get("multi_select", [])],
             "url": page["url"],
         })
     events.sort(key=lambda e: e["date"])
-    _week_cache = (time.monotonic(), events)
+    _week_cache[city] = (time.monotonic(), events)
     return events
 
 
@@ -626,13 +641,13 @@ def fmt_day(iso):
     return f"{dt.strftime('%A, %B')} {dt.day}"
 
 
-def build_rundown(events):
-    """The weekly rundown message text (Slack mrkdwn)."""
+def build_rundown(events, city):
+    """The weekly rundown message text for a city (Slack mrkdwn)."""
     mapping = rep_map()
     by_day = {}
     for e in events:
         by_day.setdefault(e["date"], []).append(e)
-    out = [RUNDOWN_HEADER, ""]
+    out = [rundown_header(city), ""]
     for d in sorted(by_day):
         out.append(f"{fmt_day(d)}:")
         out.append("")
@@ -652,21 +667,18 @@ def cycle_start_epoch():
     return datetime(monday.year, monday.month, monday.day, tzinfo=RUNDOWN_TZ).timestamp()
 
 
-def rundown_posted_this_week(client):
-    """Scan the rundown channels for a rundown message already posted this week
+def rundown_posted_this_week(client, city, channel):
+    """True if this city's rundown was already posted in this channel this week
     (so a restart/republish doesn't cause a duplicate post)."""
     start = cycle_start_epoch()
-    for ch in RUNDOWN_CHANNELS:
-        try:
-            msgs = client.conversations_history(channel=ch, limit=100)["messages"]
-        except Exception:
-            continue
-        for m in msgs:
-            if (m.get("bot_id") or m.get("user") == BOT_USER_ID) \
-                    and RUNDOWN_SENTINEL in (m.get("text") or "") \
-                    and float(m.get("ts", 0)) >= start:
-                return True
-    return False
+    sent = rundown_sentinel(city)
+    try:
+        msgs = client.conversations_history(channel=channel, limit=100)["messages"]
+    except Exception:
+        return False
+    return any((m.get("bot_id") or m.get("user") == BOT_USER_ID)
+               and sent in (m.get("text") or "") and float(m.get("ts", 0)) >= start
+               for m in msgs)
 
 
 def reminder_sent_this_week(client):
@@ -681,66 +693,65 @@ def reminder_sent_this_week(client):
                for m in msgs)
 
 
-def post_rundown(client, events):
-    if rundown_posted_this_week(client):
-        log.info("rundown already posted this week; not re-posting")
-        return
-    text = build_rundown(events)
-    _rundown_msgs.clear()                          # track this week's rundown messages
-    for ch in RUNDOWN_CHANNELS:
+def post_rundown(client, city, events):
+    """Post a city's rundown to its routed channels (skipping any channel that
+    already has it this week). NYC also mirrors events to the shared calendar."""
+    text = build_rundown(events, city)
+    for ch in RUNDOWN_ROUTING[city]:
+        if rundown_posted_this_week(client, city, ch):
+            log.info("%s rundown already in %s this week; skipping", city, ch)
+            continue
         try:
-            resp = client.chat_postMessage(channel=ch, text=text)
+            resp = client.chat_postMessage(channel=ch, text=text,
+                                           unfurl_links=False, unfurl_media=False)
             _rundown_msgs.add((ch, resp["ts"]))
         except Exception:
-            log.exception("failed to post rundown to %s", ch)
-    log.info("posted weekly rundown to %s (%d events)", RUNDOWN_CHANNELS, len(events))
-    try:
-        reconcile_calendar()                       # mirror this week's events to gcal
-    except Exception:
-        log.exception("weekly calendar sync failed")
+            log.exception("failed to post %s rundown to %s", city, ch)
+    log.info("posted %s rundown (%d events) to %s", city, len(events), RUNDOWN_ROUTING[city])
+    if city == "NYC":
+        try:
+            reconcile_calendar()                   # mirror this week's NYC events to gcal
+        except Exception:
+            log.exception("weekly calendar sync failed")
 
 
-def rundown_ts_all(client, channel):
-    """Every rundown message the bot posted THIS WEEK in a channel — from memory
-    plus a history scan — so duplicate posts all stay in sync. Logs read errors
-    (missing scope / not in channel) instead of hiding them."""
-    found = {ts for ch, ts in _rundown_msgs if ch == channel}
+def rundown_ts_all(client, channel, city):
+    """Every message-ts of a given city's rundown posted in a channel this week
+    (by history scan, restart-safe). Logs read errors instead of hiding them."""
     start = cycle_start_epoch()
+    sent = rundown_sentinel(city)
     try:
         msgs = client.conversations_history(channel=channel, limit=200)["messages"]
     except Exception:
         log.exception("couldn't read history of %s (bot not in channel? missing scope?)", channel)
-        return sorted(found)
-    for m in msgs:
-        if (m.get("bot_id") or m.get("user") == BOT_USER_ID) \
-                and RUNDOWN_SENTINEL in (m.get("text") or "") \
-                and float(m.get("ts", 0)) >= start:
-            found.add(m["ts"])
-    if not found:
-        log.warning("no rundown message found in %s (scanned %d msgs this week)", channel, len(msgs))
-    return sorted(found)
+        return []
+    return sorted(m["ts"] for m in msgs
+                  if (m.get("bot_id") or m.get("user") == BOT_USER_ID)
+                  and sent in (m.get("text") or "") and float(m.get("ts", 0)) >= start)
 
 
 def edit_rundowns(client):
-    """Regenerate the rundown from current Notion data and edit EVERY rundown
-    message this week in each channel in place, so all copies stay in sync."""
-    text = build_rundown(fetch_week_events())
+    """Regenerate each city's rundown from current Notion data and edit every copy
+    of it (this week, in that city's channels) in place, so all stay in sync."""
     edited = 0
-    for ch in RUNDOWN_CHANNELS:
-        for ts in rundown_ts_all(client, ch):
-            try:
-                client.chat_update(channel=ch, ts=ts, text=text)
-                edited += 1
-            except Exception:
-                log.exception("failed to update rundown %s/%s", ch, ts)
-    log.info("edited %d rundown message(s) across %s", edited, RUNDOWN_CHANNELS)
+    for city in RUNDOWN_CITIES:
+        text = build_rundown(fetch_week_events(city), city)
+        for ch in RUNDOWN_ROUTING[city]:
+            for ts in rundown_ts_all(client, ch, city):
+                try:
+                    client.chat_update(channel=ch, ts=ts, text=text)
+                    edited += 1
+                except Exception:
+                    log.exception("failed to update %s rundown %s/%s", city, ch, ts)
+    log.info("edited %d rundown message(s) across cities", edited)
 
 
 def send_reps_reminder(client, missing):
     """FYI DM to Sean listing this week's events that still have no reps."""
     lines = [f"Hi! {REPS_REMINDER_SENTINEL} for the following events this week:"]
     for e in missing:
-        lines.append(f"{fmt_day(e['date'])} — {e['event']} {e['url']}")
+        city = f" ({e['city']})" if e.get("city") else ""
+        lines.append(f"{fmt_day(e['date'])}{city} — {e['event']} {e['url']}")
     lines.append("The rundown has been posted; assign reps and it'll update. Thanks!")
     dm = client.conversations_open(users=REPS_ALERT_USER)["channel"]["id"]
     client.chat_postMessage(channel=dm, text="\n".join(lines))
@@ -1133,14 +1144,16 @@ def update_calendar_guests(page_id, rep_names):
 
 
 def run_weekly_rundown(client):
-    """Monday 10am job: always post the rundown, and DM Sean an FYI if any events
-    are still missing reps (no longer gated on a reaction)."""
-    events = fetch_week_events()
-    if not events:
-        log.info("no %s events this week; skipping rundown", RUNDOWN_CITY)
-        return
-    post_rundown(client, events)
-    missing = [e for e in events if not e["reps"]]
+    """Monday 10am job: post each city's rundown to its channels, and DM Sean an FYI
+    listing any events (across cities) still missing reps."""
+    missing = []
+    for city in RUNDOWN_CITIES:
+        events = fetch_week_events(city)
+        if not events:
+            log.info("no %s events this week; skipping that rundown", city)
+            continue
+        post_rundown(client, city, events)
+        missing += [e for e in events if not e["reps"]]
     if missing and not reminder_sent_this_week(client):
         send_reps_reminder(client, missing)
 
@@ -2733,7 +2746,7 @@ def cmd_events_week(ack, body, client):
 
 def _send_week_preview(client, channel, user):
     events = fetch_week_events()
-    text = build_rundown(events) if events else "No NYC events this week."
+    text = build_rundown(events, RUNDOWN_CITY) if events else "No NYC events this week."
     try:
         client.chat_postEphemeral(channel=channel, user=user, text=text)
     except Exception:
