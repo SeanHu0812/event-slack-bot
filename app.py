@@ -533,25 +533,55 @@ def first_url(text):
     return m.group(0).rstrip(".,);") if m else None
 
 
-def rep_map():
-    """name(lowercased) -> Slack user ID, from the published REP_MAP_CSV tab.
-    The Slack-ID cell is detected by shape, so column order/headers don't matter."""
-    url = os.environ.get("REP_MAP_CSV")
-    if not url:
-        return {}
+# Rep directory: Name | Member ID (Slack) | Email | Notes. Published-CSV URL.
+# The Notes column may carry "Notion: <alias> / <alias>" for reps whose Notion rep
+# name differs from their full name; those aliases are indexed too. Overridable via
+# the REP_MAP_CSV env var.
+REP_SHEET_CSV = ("https://docs.google.com/spreadsheets/d/e/2PACX-1vReO1OZyVAWPVahHN5hmeeEQ_"
+                 "aJpEhTdvSJ_-JVl8iyuaidar0B-vU3FltTOByHl_SQm40O-zD1SHqk/pub"
+                 "?gid=351787015&single=true&output=csv")
+
+
+def _rep_rows():
+    """Parse the rep sheet into rows: {name, sid, email, aliases[]}. Slack ID and
+    email are detected by shape; name is the first other cell; aliases come from any
+    'Notion: X / Y' note. Header/blank rows (no id and no email) are skipped."""
+    url = os.environ.get("REP_MAP_CSV") or REP_SHEET_CSV
     try:
         grid = _fetch_csv_grid(url)
     except Exception:
-        log.exception("could not read REP_MAP_CSV")
-        return {}
-    m = {}
+        log.exception("could not read the rep sheet")
+        return []
+    rows = []
     for row in grid:
-        sid = next((c.strip() for c in row if re.fullmatch(r"[UW][A-Z0-9]{6,}", c.strip())), None)
-        if not sid:
+        cells = [c.strip() for c in row]
+        sid = next((c for c in cells if re.fullmatch(r"[UW][A-Z0-9]{6,}", c)), None)
+        email = next((c for c in cells if "@" in c and "." in c.split("@")[-1]), None)
+        if not (sid or email):
+            continue                                   # header / blank row
+        name = next((c for c in cells if c and c != sid and c != email
+                     and not c.lower().startswith("notion:")), None)
+        aliases = []
+        for c in cells:
+            note = re.match(r"(?i)notion:\s*(.+)", c)
+            if note:
+                for part in re.split(r"[/,]", note.group(1)):
+                    p = re.sub(r"\(.*?\)", "", part).strip()   # drop "(merged)" etc.
+                    if p:
+                        aliases.append(p)
+        rows.append({"name": name, "sid": sid, "email": email, "aliases": aliases})
+    return rows
+
+
+def rep_map():
+    """name/alias(lowercased) -> Slack user ID, from the rep sheet."""
+    m = {}
+    for r in _rep_rows():
+        if not r["sid"]:
             continue
-        name = next((c.strip() for c in row if c.strip() and c.strip() != sid), None)
-        if name:
-            m[name.lower()] = sid
+        for k in [r["name"], *r["aliases"]]:
+            if k:
+                m[k.lower()] = r["sid"]
     return m
 
 
@@ -867,23 +897,14 @@ def send_lead_list(client, rep_name, event_name, invite=None):
 
 
 def rep_emails():
-    """name(lowercased) -> email, from the REP_MAP_CSV tab's email column."""
-    url = os.environ.get("REP_MAP_CSV")
-    if not url:
-        return {}
-    try:
-        grid = _fetch_csv_grid(url)
-    except Exception:
-        return {}
+    """name/alias(lowercased) -> email, from the rep sheet."""
     m = {}
-    for row in grid:
-        email = next((c.strip() for c in row if "@" in c and "." in c.split("@")[-1]), None)
-        if not email:
+    for r in _rep_rows():
+        if not r["email"]:
             continue
-        name = next((c.strip() for c in row if c.strip() and c.strip() != email
-                     and not re.fullmatch(r"[UW][A-Z0-9]{6,}", c.strip())), None)
-        if name:
-            m[name.lower()] = email
+        for k in [r["name"], *r["aliases"]]:
+            if k:
+                m[k.lower()] = r["email"]
     return m
 
 

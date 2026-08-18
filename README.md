@@ -129,9 +129,12 @@ in place rather than reposting. (Only NYC events are mirrored to the New York Ev
 Editing the rundown does **not** re-notify already-tagged reps — only a newly added rep is
 pinged — which is why changes edit in place rather than reposting.
 
-`HOLD`/`[HOLD]` events are skipped. Rep names are mapped to Slack `@`-mentions via the
-`REP_MAP_CSV` tab (name → Slack ID); unmapped names post as plain text. `/events-this-week`
-shows the current rundown to whoever runs it (ephemeral).
+`HOLD`/`[HOLD]` events are skipped. Rep names are mapped to Slack `@`-mentions and emails via
+the **rep sheet** (`REP_SHEET_CSV` in code — columns **Name · Member ID · Email · Notes**).
+A `Notion: <alias> / <alias>` note in the Notes column indexes extra aliases, so a Notion rep
+name that differs from the full name (e.g. `Stas`, `Gavin`) still resolves. Unmapped names post
+as plain text. Override the sheet with the `REP_MAP_CSV` env var. `/events-this-week` shows the
+current rundown to whoever runs it (ephemeral).
 
 **Any** rep-assignment change — a reply in the rundown thread, an @mention, or a DM —
 updates Notion and then **edits the weekly rundown message in place in both channels** so
